@@ -651,6 +651,14 @@ func (b *Bot) dispatch(ctx context.Context, v view, cmd string) {
 		b.doAdBlockToggle(ctx, v, true)
 	case "adblock_off":
 		b.doAdBlockToggle(ctx, v, false)
+	case "ad_extras":
+		b.showAdExtras(ctx, v, "")
+	case "ad_extra":
+		b.doAdExtra(ctx, v, arg)
+	case "ad_suspects":
+		b.showAdSuspects(ctx, v)
+	case "ad_block_host":
+		b.doAdBlockHost(ctx, v, arg)
 	case "ad_allow_hit":
 		b.doAdAllowHit(ctx, v, arg)
 	case "ad_allow_list":

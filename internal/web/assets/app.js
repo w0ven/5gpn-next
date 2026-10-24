@@ -125,6 +125,9 @@ function renderAdBlock(ad) {
   toggle.textContent = ad.enabled ? '● 已开启' : '○ 已关闭';
   toggle.className = 'btn btn-state ' + (ad.enabled ? 'btn-on' : 'btn-off');
 
+  renderAdTrend(hits.daily || [], ad);
+  renderAdExtras(ad.extras || [], ad.enabled);
+
   const recent = $('ad-recent');
   recent.textContent = '';
   const events = hits.recent || [];
@@ -182,6 +185,83 @@ function renderAdBlock(ad) {
       chip.appendChild(rm);
       allowBox.appendChild(chip);
     });
+  }
+}
+
+function renderAdTrend(days, ad) {
+  const box = $('ad-trend');
+  box.textContent = '';
+  const top = Math.max(1, ...days.map((d) => Number(d.count || 0)));
+  days.forEach((d) => {
+    const col = el('div', 'trend-col');
+    col.title = d.date + '：' + number(d.count) + ' 次';
+    const bar = el('i', 'trend-bar');
+    bar.style.height = (d.count ? Math.max(6, Number(d.count) / top * 100) : 2) + '%';
+    col.appendChild(bar);
+    col.appendChild(el('span', 'trend-day', String(Number(d.date.slice(8)))));
+    box.appendChild(col);
+  });
+  const meta = [];
+  meta.push('近 7 天 ' + number((ad.hits || {}).days7) + ' 次');
+  if (ad.updated_at) meta.push('anti-AD 规则 ' + relativeTime(ad.updated_at) + '更新');
+  const on = (ad.extras || []).filter((x) => x.enabled).map((x) => x.name);
+  if (on.length) meta.push('附加：' + on.join('、'));
+  $('ad-meta').textContent = meta.join(' · ');
+}
+
+function renderAdExtras(extras, enabled) {
+  const box = $('ad-extras');
+  box.textContent = '';
+  extras.forEach((x) => {
+    const item = el('button', 'extra-item' + (x.enabled ? ' on' : ''));
+    item.type = 'button';
+    item.setAttribute('aria-pressed', x.enabled ? 'true' : 'false');
+    const head = el('span', 'extra-head');
+    head.appendChild(el('span', 'extra-dot'));
+    head.appendChild(el('strong', null, x.name));
+    if (x.enabled && x.domains) head.appendChild(el('small', null, number(x.domains) + ' 条'));
+    item.appendChild(head);
+    item.appendChild(el('span', 'extra-desc', x.desc));
+    if (x.warn) item.appendChild(el('span', 'extra-warn', '⚠ ' + x.warn));
+    item.onclick = async () => {
+      item.disabled = true;
+      await adBlockAction('extra', { key: x.key, enabled: !x.enabled });
+      item.disabled = false;
+    };
+    box.appendChild(item);
+  });
+  if (!enabled) box.appendChild(el('p', 'empty', '广告拦截未开启，勾选的列表会在开启后生效。'));
+}
+
+async function loadAdSuspects() {
+  const box = $('ad-suspects');
+  try {
+    const data = await api('/api/adblock');
+    const list = data.suspects || [];
+    box.textContent = '';
+    if (!list.length) {
+      box.appendChild(el('p', 'empty', '暂时没有发现。手机正常使用一段时间后再来看；网关重启后会重新积累。'));
+      return;
+    }
+    list.forEach((s) => {
+      const row = el('div', 'hit-row');
+      const main = el('div', 'hit-main');
+      main.appendChild(el('code', 'hit-host', s.host));
+      main.appendChild(el('span', 'hit-time', '×' + number(s.count) + ' · ' + relativeTime(s.last_at)));
+      row.appendChild(main);
+      const btn = el('button', 'btn btn-sm btn-danger', '拦截');
+      btn.type = 'button';
+      btn.onclick = async () => {
+        btn.disabled = true;
+        await adBlockAction('block', { domain: s.host });
+        loadAdSuspects();
+      };
+      row.appendChild(btn);
+      box.appendChild(row);
+    });
+  } catch (err) {
+    box.textContent = '';
+    box.appendChild(el('p', 'empty warning', err.message));
   }
 }
 
@@ -574,7 +654,9 @@ $('rule-input').addEventListener('keydown', (event) => {
 loadStatus();
 loadRules();
 loadApps();
+loadAdSuspects();
 setInterval(loadStatus, 15000);
+setInterval(loadAdSuspects, 60000);
 
 // ---------- 健康监控 ----------
 

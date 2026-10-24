@@ -203,6 +203,10 @@ type AdBlockConfig struct {
 	// 注意：用户自定义规则本身就排在广告拦截之前，写一条
 	// DOMAIN-SUFFIX,xxx,direct 同样能放行；此字段只是更直观的入口。
 	Allowlist []string `json:"allowlist,omitempty"`
+
+	// Extras 是叠加在主规则之上的附加列表（AdBlockExtras 中的 Key），
+	// 由用户按自己的设备选择；默认都不开。
+	Extras []string `json:"extras,omitempty"`
 }
 
 // DefaultAdBlockURL 是默认规则源（anti-AD，中文环境命中率最高）。
@@ -210,6 +214,63 @@ const DefaultAdBlockURL = "https://anti-ad.net/domains.txt"
 
 // AdBlockRuleSetName 是广告规则集的内部名。
 const AdBlockRuleSetName = "ad-block"
+
+// AdBlockExtra 是一个可选的附加拦截列表。
+type AdBlockExtra struct {
+	Key  string `json:"key"`
+	Name string `json:"name"`
+	Desc string `json:"desc"`
+	// Warn 非空表示可能影响对应 App 的正常功能。
+	Warn string `json:"warn,omitempty"`
+	URL  string `json:"-"`
+}
+
+func hageziNative(list string) string {
+	return "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native." + list + "-onlydomains.txt"
+}
+
+// AdBlockExtras 是可叠加的附加列表。厂商列表来自 hagezi/dns-blocklists 的
+// native 系列，专拦系统级广告与数据上报，anti-AD 基本未覆盖。
+var AdBlockExtras = []AdBlockExtra{
+	{Key: "xiaomi", Name: "小米 / 红米", Desc: "MIUI、HyperOS 系统广告与数据上报", URL: hageziNative("xiaomi")},
+	{Key: "huawei", Name: "华为 / 荣耀", Desc: "EMUI、HarmonyOS、MagicOS 系统广告与数据上报", URL: hageziNative("huawei")},
+	{Key: "oppo", Name: "OPPO / 一加 / realme", Desc: "ColorOS、realme UI 系统广告与数据上报", URL: hageziNative("oppo-realme")},
+	{Key: "vivo", Name: "vivo / iQOO", Desc: "OriginOS 系统广告与数据上报", URL: hageziNative("vivo")},
+	{Key: "samsung", Name: "三星", Desc: "One UI 系统数据上报", URL: hageziNative("samsung")},
+	{Key: "apple", Name: "苹果", Desc: "iOS、macOS 系统遥测与诊断上报", URL: hageziNative("apple")},
+	{Key: "tiktok", Name: "TikTok", Desc: "TikTok 广告与日志上报",
+		Warn: "也会拦 TikTok 的网络配置接口，可能影响 TikTok 使用", URL: hageziNative("tiktok")},
+	{Key: "awavenue", Name: "秋风广告规则", Desc: "国内 App 广告 SDK 的精确域名，几乎不误拦",
+		URL: "https://raw.githubusercontent.com/TG-Twilight/AWAvenue-Ads-Rule/main/Filters/AWAvenue-Ads-Rule-Mosdns_v5.txt"},
+}
+
+// AdBlockExtraByKey 查找附加列表。
+func AdBlockExtraByKey(key string) (AdBlockExtra, bool) {
+	for _, x := range AdBlockExtras {
+		if x.Key == key {
+			return x, true
+		}
+	}
+	return AdBlockExtra{}, false
+}
+
+// AdBlockExtraRuleSet 是附加列表的规则集名。
+func AdBlockExtraRuleSet(key string) string { return AdBlockRuleSetName + "-" + key }
+
+// AdBlockExtrasOn 返回已开启的附加列表（目录顺序，忽略未知 Key）。
+func (c *Config) AdBlockExtrasOn() []AdBlockExtra {
+	on := map[string]bool{}
+	for _, k := range c.AdBlock.Extras {
+		on[k] = true
+	}
+	var out []AdBlockExtra
+	for _, x := range AdBlockExtras {
+		if on[x.Key] {
+			out = append(out, x)
+		}
+	}
+	return out
+}
 
 // AdBlockURLOrDefault 返回实际使用的规则源。
 func (c *Config) AdBlockURLOrDefault() string {
@@ -234,7 +295,11 @@ func (c *Config) BuiltinAdBlock() []string {
 		}
 		out = append(out, "DOMAIN-SUFFIX,"+d+",direct")
 	}
-	return append(out, "RULE-SET,"+AdBlockRuleSetName+",block")
+	out = append(out, "RULE-SET,"+AdBlockRuleSetName+",block")
+	for _, x := range c.AdBlockExtrasOn() {
+		out = append(out, "RULE-SET,"+AdBlockExtraRuleSet(x.Key)+",block")
+	}
+	return out
 }
 
 // EffectiveRuleSets 返回实际需要加载的规则集（含广告规则）。
@@ -259,6 +324,13 @@ func (c *Config) EffectiveRuleSets() []RuleSetConfig {
 			URL:           c.AdBlockURLOrDefault(),
 			IntervalHours: 24,
 		})
+	}
+	if c.AdBlock.Enabled {
+		for _, x := range c.AdBlockExtrasOn() {
+			if name := AdBlockExtraRuleSet(x.Key); !has(name) {
+				out = append(out, RuleSetConfig{Name: name, Kind: "domain", URL: x.URL, IntervalHours: 24})
+			}
+		}
 	}
 	// 应用清单只在启用时下载，与广告规则同理不写进 rulesets 数组。
 	for _, a := range apps.All() {

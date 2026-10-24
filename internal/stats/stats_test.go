@@ -86,3 +86,25 @@ func TestAdBlockRecentRecordsAreBounded(t *testing.T) {
 		t.Fatalf("top count=%d, want 5", len(got.Top))
 	}
 }
+
+func TestAdBlockSummaryDailyCoversSevenDays(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "traffic.json"))
+	s.AdBlockSuccess("ads.example")
+	s.AdBlockSuccess("ads.example")
+	got := s.AdBlockSummary(0, 0)
+	if len(got.Daily) != 7 {
+		t.Fatalf("应固定返回 7 天: %+v", got.Daily)
+	}
+	last := got.Daily[6]
+	if last.Count != 2 || last.Date != dayKey(s.now().In(trafficLocation)) {
+		t.Fatalf("最后一天应是今天且计数为 2: %+v", got.Daily)
+	}
+	for _, d := range got.Daily[:6] {
+		if d.Count != 0 {
+			t.Fatalf("没有数据的日子应为 0: %+v", got.Daily)
+		}
+	}
+	if got.Daily[0].Date >= got.Daily[6].Date {
+		t.Fatalf("应由旧到新排列: %+v", got.Daily)
+	}
+}

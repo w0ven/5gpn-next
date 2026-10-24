@@ -120,3 +120,50 @@ func TestAdBlockCustomURL(t *testing.T) {
 		t.Fatalf("default URL wrong: %s", got)
 	}
 }
+
+func TestAdBlockExtrasFollowMainListInCatalogOrder(t *testing.T) {
+	c := Default()
+	c.AdBlock.Enabled = true
+	c.AdBlock.Allowlist = []string{"good.example"}
+	c.AdBlock.Extras = []string{"apple", "nope", "xiaomi"}
+
+	want := []string{
+		"DOMAIN-SUFFIX,good.example,direct",
+		"RULE-SET,ad-block,block",
+		"RULE-SET,ad-block-xiaomi,block",
+		"RULE-SET,ad-block-apple,block",
+	}
+	if got := c.BuiltinAdBlock(); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("白名单在前、主规则其次、附加列表按目录顺序且忽略未知项:\n got %v\nwant %v", got, want)
+	}
+	urls := map[string]string{}
+	for _, rs := range c.EffectiveRuleSets() {
+		urls[rs.Name] = rs.URL
+	}
+	if !strings.Contains(urls["ad-block-xiaomi"], "native.xiaomi-onlydomains.txt") || urls["ad-block-apple"] == "" {
+		t.Fatalf("已开启的附加列表应加载规则集: %v", urls)
+	}
+	if _, ok := urls["ad-block-nope"]; ok {
+		t.Fatal("未知附加列表不应加载")
+	}
+
+	c.AdBlock.Enabled = false
+	for _, rs := range c.EffectiveRuleSets() {
+		if strings.HasPrefix(rs.Name, AdBlockRuleSetName) {
+			t.Fatalf("拦截关闭时附加列表也不应下载: %s", rs.Name)
+		}
+	}
+}
+
+func TestAdBlockExtrasCatalogIsWellFormed(t *testing.T) {
+	seen := map[string]bool{}
+	for _, x := range AdBlockExtras {
+		if x.Key == "" || x.Name == "" || x.Desc == "" || !strings.HasPrefix(x.URL, "https://") || seen[x.Key] {
+			t.Errorf("附加列表定义不完整或重复: %+v", x)
+		}
+		seen[x.Key] = true
+		if len("ad_extra:"+x.Key) > 64 {
+			t.Errorf("Key 过长，Bot 回调数据会超过 64 字节: %s", x.Key)
+		}
+	}
+}

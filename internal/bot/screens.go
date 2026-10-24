@@ -558,56 +558,6 @@ func ruleFingerprint(r string) string {
 
 // ---------- 广告拦截 ----------
 
-func (b *Bot) showAdBlock(ctx context.Context, v view) {
-	ad := b.Manager.Status(b.Version).AdBlock
-
-	var sb strings.Builder
-	state := "已关闭"
-	if ad.Enabled {
-		state = "已开启"
-	}
-	sb.WriteString(head("shield", "广告拦截", state))
-	var info strings.Builder
-	switch {
-	case ad.Enabled && ad.Domains > 0:
-		fmt.Fprintf(&info, "规则　<b>%s</b> 条\n", groupDigits(ad.Domains))
-	case ad.Enabled:
-		info.WriteString(ic("warn") + " 规则尚未载入，点「更新规则」重试\n")
-	}
-	fmt.Fprintf(&info, "今日　<b>%d</b> 次 · 累计 <b>%d</b> 次", ad.Hits.Today, ad.Hits.Total)
-	if ad.Allowlist > 0 {
-		fmt.Fprintf(&info, "\n白名单　<b>%d</b> 条", ad.Allowlist)
-	}
-	sb.WriteString(card(info.String()))
-
-	var rows [][]btn
-	if n := min(len(ad.Hits.Recent), 4); n > 0 {
-		var lines strings.Builder
-		for i := 0; i < n; i++ {
-			ev := ad.Hits.Recent[i]
-			if i > 0 {
-				lines.WriteString("\n")
-			}
-			fmt.Fprintf(&lines, "<code>%s</code> · %s", esc(ev.Host), time.Unix(ev.At, 0).Format("15:04"))
-			rows = append(rows, []btn{{Text: "放行 " + truncateText(ev.Host, 24), Data: "ad_allow_hit:" + ruleFingerprint(ev.Host)}})
-		}
-		sb.WriteString("\n<b>最近拦截</b>　<i>误拦了就点下面放行</i>\n" + card(lines.String()))
-	}
-	sb.WriteString("\n<i>只拦系统 DNS 查询；App 自带 DoH 或直连 IP 拦不到。</i>")
-
-	if ad.Enabled {
-		rows = append(rows,
-			[]btn{{Text: "白名单", Data: "ad_allow_list"}, {Text: "更新规则", Data: "adblock_on"}},
-			[]btn{{Text: "关闭拦截", Data: "adblock_off", Style: "danger"}})
-	} else {
-		rows = append(rows,
-			[]btn{{Text: "开启拦截", Data: "adblock_on", Icon: "shield", Style: "success"}},
-			[]btn{{Text: "白名单", Data: "ad_allow_list"}})
-	}
-	rows = append(rows, navRow("menu"))
-	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
-}
-
 func groupDigits(n int) string {
 	s := strconv.Itoa(n)
 	for i := len(s) - 3; i > 0; i -= 3 {

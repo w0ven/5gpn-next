@@ -378,6 +378,14 @@ type AdBlockSummary struct {
 	Total  int64          `json:"total"`
 	Recent []BlockEvent   `json:"recent"`
 	Top    []BlockedEntry `json:"top"`
+	// Daily 是最近 7 个自然日的拦截次数，由旧到新，没有数据的日子为 0。
+	Daily []DayCount `json:"daily"`
+}
+
+// DayCount 是某一天的计数。
+type DayCount struct {
+	Date  string `json:"date"`
+	Count int64  `json:"count"`
 }
 
 // AdBlockSummary 返回成功拦截统计；最近记录按时间倒序。
@@ -403,6 +411,14 @@ func (s *Store) AdBlockSummary(recentN, topN int) AdBlockSummary {
 		if key >= start7 && key <= todayKey {
 			out.Days7 += d.AdBlocked
 		}
+	}
+	for i := 6; i >= 0; i-- {
+		key := now.AddDate(0, 0, -i).Format("2006-01-02")
+		dc := DayCount{Date: key}
+		if d := s.data.Days[key]; d != nil {
+			dc.Count = d.AdBlocked
+		}
+		out.Daily = append(out.Daily, dc)
 	}
 
 	if recentN < 0 {
