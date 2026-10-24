@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/w0ven/5gpn-next/internal/bot"
+	"github.com/w0ven/5gpn-next/internal/certrenew"
 	"github.com/w0ven/5gpn-next/internal/config"
 	"github.com/w0ven/5gpn-next/internal/egress"
 	"github.com/w0ven/5gpn-next/internal/fw"
@@ -559,6 +560,16 @@ func cmdRun(args []string) error {
 	}
 	fwCancel()
 
+	// 上面的兜底 drop 同样覆盖公网 80。安装器之后不会再运行，老机器的续期
+	// 钩子若仍是只停服、不放行 ACME 的旧版，证书会在到期后静默失效。
+	hookCtx, hookCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if changed, herr := certrenew.EnsureHooks(hookCtx, a.cfg.Gateway.CertFile); herr != nil {
+		log.Printf("警告: 更新证书续期钩子失败: %v", herr)
+	} else if changed {
+		log.Printf("已更新证书续期钩子：续期期间临时放行 ACME 80 端口")
+	}
+	hookCancel()
+
 	// 内网 Web 面板：挂在根路径，仅内网卡来源可达，无需登录
 	var panelHandler http.Handler
 	if a.cfg.Panel.Enabled {
@@ -830,6 +841,16 @@ func cmdRun(args []string) error {
 					}
 				}
 			}()
+		}
+
+		// 证书过期后 DoT 握手全部失败，健康页只有打开时才看得到，必须主动推送。
+		if health.Notify != nil && a.cfg.Gateway.CertFile != "" {
+			cw := &certrenew.ExpiryWatcher{
+				CertFile:  a.cfg.Gateway.CertFile,
+				StateFile: certrenew.AlertStateFile,
+				Notify:    health.Notify,
+			}
+			go cw.Run(botCtx, 20*time.Second, 12*time.Hour)
 		}
 	}
 
