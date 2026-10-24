@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -19,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/w0ven/5gpn-next/internal/certrenew"
 	"github.com/w0ven/5gpn-next/internal/config"
 	"github.com/w0ven/5gpn-next/internal/egress"
 	"github.com/w0ven/5gpn-next/internal/monitor"
@@ -1351,7 +1353,8 @@ type SysHealth struct {
 	MemoryMB   float64
 	Goroutines int
 	Uptime     string
-	CertDays   int // -1 表示未知
+	CertKnown  bool
+	CertDays   int // 剩余整天数，已过期时为负
 }
 
 // SysHealthNow 返回当前系统读数。
@@ -1367,28 +1370,22 @@ func (m *Manager) SysHealthNow() SysHealth {
 		MemoryMB:   memoryMB(),
 		Goroutines: runtime.NumGoroutine(),
 		Uptime:     humanDuration(time.Since(started)),
-		CertDays:   certDaysLeft(cert),
 	}
+	h.CertDays, h.CertKnown = certDaysLeft(cert, time.Now())
 	return h
 }
 
-// certDaysLeft 返回证书剩余天数；解析失败返回 -1。
-func certDaysLeft(path string) int {
+// certDaysLeft 返回证书剩余整天数（向下取整），读不到证书时 ok=false。
+// 过期必须表示为负数而不是「未知」：过期正是最需要展示的状态。
+func certDaysLeft(path string, now time.Time) (days int, ok bool) {
 	if path == "" {
-		return -1
+		return 0, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "openssl", "x509", "-enddate", "-noout", "-in", path).Output()
+	t, err := certrenew.NotAfter(path)
 	if err != nil {
-		return -1
+		return 0, false
 	}
-	raw := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(out)), "notAfter="))
-	t, err := time.Parse("Jan 2 15:04:05 2006 MST", raw)
-	if err != nil {
-		return -1
-	}
-	return int(time.Until(t).Hours() / 24)
+	return int(math.Floor(t.Sub(now).Hours() / 24)), true
 }
 
 // SortedEgressNames 返回排序后的出口名，便于稳定展示。

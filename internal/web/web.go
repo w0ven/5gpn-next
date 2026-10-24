@@ -257,6 +257,11 @@ func (p *Panel) apiHealth(w http.ResponseWriter, r *http.Request) {
 			Down:    e.DownBytes,
 		})
 	}
+	// 读不到证书时输出 null；负数表示已过期。
+	var certDays any
+	if sys.CertKnown {
+		certDays = sys.CertDays
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"enabled":      true,
 		"egress":       egs,
@@ -268,7 +273,7 @@ func (p *Panel) apiHealth(w http.ResponseWriter, r *http.Request) {
 			"memory_mb":  sys.MemoryMB,
 			"goroutines": sys.Goroutines,
 			"uptime":     sys.Uptime,
-			"cert_days":  sys.CertDays,
+			"cert_days":  certDays,
 		},
 	})
 }

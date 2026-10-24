@@ -6,6 +6,7 @@ import (
 	"html"
 	"strings"
 
+	"github.com/w0ven/5gpn-next/internal/certrenew"
 	"github.com/w0ven/5gpn-next/internal/monitor"
 )
 
@@ -63,12 +64,8 @@ func (b *Bot) showHealth(ctx context.Context, v view) {
 	fmt.Fprintf(&sb, "%s 内存　<b>%.1f MB</b>\n", em("💻"), sys.MemoryMB)
 	fmt.Fprintf(&sb, "🧵 goroutine　<b>%d</b>\n", sys.Goroutines)
 	fmt.Fprintf(&sb, "%s 运行　<b>%s</b>", em("🔋"), sys.Uptime)
-	if sys.CertDays >= 0 {
-		icon := "🔐"
-		if sys.CertDays <= 14 {
-			icon = "⚠️"
-		}
-		fmt.Fprintf(&sb, "\n%s 证书剩余　<b>%d 天</b>", icon, sys.CertDays)
+	if sys.CertKnown {
+		sb.WriteString("\n" + certHealthLine(sys.CertDays))
 	}
 	sb.WriteString("</blockquote>\n")
 	sb.WriteString("\n<i>点击出口名可查看最近异常明细 ↓</i>")
@@ -87,6 +84,18 @@ func (b *Bot) showHealth(ctx context.Context, v view) {
 	}
 	rows = append(rows, []btn{{"🔄 刷新", "health"}, {"🚨 告警设置", "monitor_settings"}}, []btn{{"« 返回主菜单", "menu"}})
 	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
+}
+
+// certHealthLine 渲染证书状态。过期时 DoT 全部握手失败，必须比临期更醒目。
+func certHealthLine(days int) string {
+	switch {
+	case days < 0:
+		return fmt.Sprintf("🚨 证书已过期　<b>%d 天</b>", -days)
+	case days <= certrenew.WarnDays:
+		return fmt.Sprintf("⚠️ 证书剩余　<b>%d 天</b>", days)
+	default:
+		return fmt.Sprintf("🔐 证书剩余　<b>%d 天</b>", days)
+	}
 }
 
 // egressHealthLine 渲染单个出口的两行摘要。
