@@ -798,8 +798,7 @@ func cmdRun(args []string) error {
 				// 整个升级从点击到最终结果只占一条消息；没有目标
 				// （手动重启、目标丢失）时退回推送新消息。
 				if t, ok := update.ConsumeNotifyTarget(); ok {
-					tb.EditMessage(botCtx, t.ChatID, t.MsgID, text,
-						`{"inline_keyboard":[[{"text":"🏠 主菜单","callback_data":"menu"}]]}`)
+					tb.EditMessage(botCtx, t.ChatID, t.MsgID, text, bot.HomeKeyboard())
 					return
 				}
 				tb.Notify(botCtx, text)
@@ -809,9 +808,8 @@ func cmdRun(args []string) error {
 			// 日常 restart / 崩溃拉起不再刷屏。
 			go func() {
 				time.Sleep(2 * time.Second)
-				tb.Notify(botCtx, "✅ <b>5gpn-NEXT 已就绪</b>\n\n"+
-					"版本  <code>"+version+"</code>\n"+
-					"发送 /start 打开管理菜单")
+				tb.NotifyAction(botCtx, "✅ <b>5gpn-NEXT 已就绪</b>　<code>"+version+"</code>",
+					"打开主页", "menu", "home")
 			}()
 		}
 
@@ -846,9 +844,10 @@ func cmdRun(args []string) error {
 					if err != nil || !has || mgr.IsIgnoredVersion(rel.Tag) || !updater.ShouldNotify(rel.Tag) {
 						continue
 					}
-					tb.Notify(botCtx, fmt.Sprintf(
-						"\U0001F514 <b>发现新版本 %s</b>%s当前 <code>%s</code>%s%s%s在菜单「更新」中可一键升级。",
-						rel.Tag, nl2, version, nl2, htmlPre(rel.Notes, 800), nl2))
+					tb.NotifyAction(botCtx, fmt.Sprintf(
+						"\U0001F514 <b>发现新版本 %s</b>　当前 <code>%s</code>%s%s",
+						rel.Tag, version, nl2, htmlPre(rel.Notes, 800)),
+						"查看并升级", "update", "update")
 					if a.cfg.Update.AutoApply {
 						actx, acancel := context.WithTimeout(context.Background(), 5*time.Minute)
 						if out, aerr := updater.Apply(actx, rel.Tag); aerr == nil {

@@ -10,79 +10,63 @@ import (
 	"github.com/w0ven/5gpn-next/internal/monitor"
 )
 
-// showHealth 展示健康监控总览：出口探测、真实转发、DoT、会话水位与系统面。
+// showHealth 展示健康监控总览：出口探测、真实转发、DoT、会话水位与网关进程。
 func (b *Bot) showHealth(ctx context.Context, v view) {
 	h, ok := b.Manager.HealthReport()
 	if !ok {
-		b.render(ctx, v, pageHead("🔮", "健康")+"\n监控未启用。", backTo("menu"))
+		b.render(ctx, v, head("status", "健康")+"监控未启用。", backTo("status"))
 		return
 	}
 	sys := b.Manager.SysHealthNow()
 
 	var sb strings.Builder
-	sb.WriteString(pageHead("🔮", "健康") + "\n")
+	sb.WriteString(head("status", "健康"))
 
-	// ---- 出口 ----
 	if len(h.Egress) == 0 {
-		sb.WriteString("<i>探测数据积累中，约 1 分钟后可见 ⏳</i>\n\n")
+		sb.WriteString(card("探测数据积累中，约 1 分钟后可见。"))
 	} else {
-		sb.WriteString("<b>出口链路</b>\n")
-		for _, e := range h.Egress {
-			sb.WriteString(egressHealthLine(e))
-		}
 		target := h.ProbeTarget
 		if target == "" {
 			target = "远端目标"
 		}
-		fmt.Fprintf(&sb, "<i>%s · 链路 / 节点 / 桥</i>\n\n", html.EscapeString(target))
-	}
-
-	// ---- DoT ----
-	sb.WriteString("<b>DNS（DoT 上游）</b>\n<blockquote>")
-	if h.DNS1h.Count > 0 {
-		fmt.Fprintf(&sb, "%s 1h　均 <b>%s</b> · p95 <b>%s</b> · 失败 <b>%d</b>/%d",
-			rateIcon(h.DNS1h.FailRate()), h.DNS1h.Avg(), h.DNS1h.P95(), h.DNS1h.Fail, h.DNS1h.Count)
-	} else {
-		sb.WriteString("1h 内无上游查询（缓存命中或无流量）")
-	}
-	if h.DNS24h.Count > 0 {
-		fmt.Fprintf(&sb, "\n🕐 24h　均 <b>%s</b> · p95 <b>%s</b> · 失败 <b>%d</b>/%d",
-			h.DNS24h.Avg(), h.DNS24h.P95(), h.DNS24h.Fail, h.DNS24h.Count)
-	}
-	sb.WriteString("</blockquote>\n")
-
-	// ---- 会话水位 ----
-	sb.WriteString("<b>会话水位</b>\n<blockquote>")
-	fmt.Fprintf(&sb, "%s TCP 转发　<b>%d</b> / %d", levelIcon(h.TCPActive, h.TCPMax), h.TCPActive, h.TCPMax)
-	if h.QUICMax > 0 {
-		fmt.Fprintf(&sb, "\n%s QUIC 会话　<b>%d</b> / %d", levelIcon(h.QUICActive, h.QUICMax), h.QUICActive, h.QUICMax)
-	}
-	sb.WriteString("</blockquote>\n")
-
-	// ---- 系统 ----
-	sb.WriteString("<b>网关进程</b>\n<blockquote>")
-	fmt.Fprintf(&sb, "%s 内存　<b>%.1f MB</b>\n", em("💻"), sys.MemoryMB)
-	fmt.Fprintf(&sb, "🧵 goroutine　<b>%d</b>\n", sys.Goroutines)
-	fmt.Fprintf(&sb, "%s 运行　<b>%s</b>", em("🔋"), sys.Uptime)
-	if sys.CertKnown {
-		sb.WriteString("\n" + certHealthLine(sys.CertDays))
-	}
-	sb.WriteString("</blockquote>\n")
-	sb.WriteString("\n<i>点击出口名可查看最近异常明细 ↓</i>")
-
-	var rows [][]btn
-	var cur []btn
-	for _, e := range h.Egress {
-		cur = append(cur, btn{"🔍 " + truncateText(e.Name, 10), "health_detail:" + e.Name})
-		if len(cur) == 2 {
-			rows = append(rows, cur)
-			cur = nil
+		fmt.Fprintf(&sb, "\n<b>出口链路</b>　<i>探测 %s</i>\n", html.EscapeString(target))
+		for _, e := range h.Egress {
+			sb.WriteString(egressHealthLine(e))
 		}
 	}
-	if len(cur) > 0 {
-		rows = append(rows, cur)
+
+	var dns strings.Builder
+	if h.DNS1h.Count > 0 {
+		fmt.Fprintf(&dns, "%s 1h　均 <b>%s</b> · p95 <b>%s</b> · 失败 <b>%d</b>/%d",
+			rateIcon(h.DNS1h.FailRate()), h.DNS1h.Avg(), h.DNS1h.P95(), h.DNS1h.Fail, h.DNS1h.Count)
+	} else {
+		dns.WriteString("1h 内无上游查询（缓存命中或无流量）")
 	}
-	rows = append(rows, []btn{{"🔄 刷新", "health"}, {"🚨 告警设置", "monitor_settings"}}, []btn{{"« 返回主菜单", "menu"}})
+	if h.DNS24h.Count > 0 {
+		fmt.Fprintf(&dns, "\n24h　均 <b>%s</b> · p95 <b>%s</b> · 失败 <b>%d</b>/%d",
+			h.DNS24h.Avg(), h.DNS24h.P95(), h.DNS24h.Fail, h.DNS24h.Count)
+	}
+	sb.WriteString("\n<b>DNS 上游</b>\n" + card(dns.String()) + "\n")
+
+	var proc strings.Builder
+	fmt.Fprintf(&proc, "%s TCP　<b>%d</b> / %d", levelIcon(h.TCPActive, h.TCPMax), h.TCPActive, h.TCPMax)
+	if h.QUICMax > 0 {
+		fmt.Fprintf(&proc, "　%s QUIC　<b>%d</b> / %d", levelIcon(h.QUICActive, h.QUICMax), h.QUICActive, h.QUICMax)
+	}
+	fmt.Fprintf(&proc, "\n内存　<b>%.1f MB</b> · goroutine <b>%d</b> · 运行 <b>%s</b>", sys.MemoryMB, sys.Goroutines, sys.Uptime)
+	if sys.CertKnown {
+		proc.WriteString("\n" + certHealthLine(sys.CertDays))
+	}
+	sb.WriteString("\n<b>网关</b>\n" + card(proc.String()))
+
+	var bs []btn
+	for _, e := range h.Egress {
+		bs = append(bs, btn{Text: truncateText(e.Name, 12), Data: "health_detail:" + e.Name, Icon: "probe"})
+	}
+	rows := grid(2, bs)
+	rows = append(rows,
+		[]btn{{Text: "刷新", Data: "refresh:health"}, {Text: "告警设置", Data: "monitor_settings", Icon: "alert"}},
+		navRow("status"))
 	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
 }
 
@@ -152,28 +136,28 @@ func (b *Bot) showHealthDetail(ctx context.Context, v view, name string) {
 	samples := b.Manager.HealthAnomalies(name, 20)
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "🔍  <b>%s</b>\n\n", html.EscapeString(name))
+	sb.WriteString(head("probe", html.EscapeString(name), "近 24 小时异常"))
 	if len(samples) == 0 {
-		sb.WriteString("✅ 24h 内没有异常探测点，这条出口很稳。\n")
+		sb.WriteString(card(ic("ok") + " 没有异常探测点，这条出口很稳。"))
 	} else {
-		sb.WriteString("<i>失败或显著慢于均值的探测点（新的在前）：</i>\n<blockquote>")
+		var lines strings.Builder
 		for i, s := range samples {
 			if i > 0 {
-				sb.WriteString("\n")
+				lines.WriteString("\n")
 			}
 			if s.OK {
-				fmt.Fprintf(&sb, "🐢 %s　<b>%s</b>（慢）", s.At.Local().Format("01-02 15:04"), monitor.FormatUS(s.US))
+				fmt.Fprintf(&lines, "🐢 %s　<b>%s</b> 慢", s.At.Local().Format("01-02 15:04"), monitor.FormatUS(s.US))
 			} else {
-				fmt.Fprintf(&sb, "❌ %s　<b>失败</b>", s.At.Local().Format("01-02 15:04"))
+				fmt.Fprintf(&lines, "🔴 %s　<b>失败</b>", s.At.Local().Format("01-02 15:04"))
 			}
 		}
-		sb.WriteString("</blockquote>\n")
-		sb.WriteString("\n<i>感觉「卡了一下」时，对一下这里的时间点即可定位。</i>")
+		sb.WriteString(card(lines.String()))
+		sb.WriteString("\n<i>失败或明显慢于均值的探测点，新的在前。感觉卡顿时对一下时间点。</i>")
 	}
 
 	b.render(ctx, v, sb.String(), inlineKeyboard(
-		[]btn{{"🔄 刷新", "health_detail:" + name}},
-		[]btn{{"« 返回健康监控", "health"}},
+		[]btn{{Text: "刷新", Data: "refresh:health_detail:" + name}},
+		navRow("health"),
 	))
 }
 
@@ -222,24 +206,22 @@ func (b *Bot) showMonitorSettings(ctx context.Context, v view) {
 	after, cooldown, disabled := b.Manager.MonitorSettings()
 
 	var sb strings.Builder
-	sb.WriteString(pageHead("💡", "告警") + "\n")
-	state := "🟢 开启"
+	state := "已开启"
 	if disabled {
-		state = "🔴 关闭"
+		state = "已关闭"
 	}
-	fmt.Fprintf(&sb, "告警推送　<b>%s</b>\n", state)
-	fmt.Fprintf(&sb, "连续失败阈值　<b>%d</b> 次（约 %d 分钟无响应）\n", after, after)
-	fmt.Fprintf(&sb, "告警冷却　<b>%d</b> 分钟\n", cooldown)
-	sb.WriteString("\n<i>出口连续探测失败达到阈值时 Bot 主动推送；恢复后自动通知。修改即时生效并持久化。</i>")
+	sb.WriteString(head("alert", "告警", state))
+	sb.WriteString(card(fmt.Sprintf("连续失败　<b>%d</b> 次后告警（约 %d 分钟无响应）\n冷却　<b>%d</b> 分钟", after, after, cooldown)))
+	sb.WriteString("\n<i>出口连续探测失败达到阈值时推送，恢复后自动通知。</i>")
 
-	toggleLabel := "🔴 关闭告警推送"
+	toggle := btn{Text: "关闭告警", Data: "monitor_toggle_alerts", Icon: "mute", Style: "danger"}
 	if disabled {
-		toggleLabel = "🟢 开启告警推送"
+		toggle = btn{Text: "开启告警", Data: "monitor_toggle_alerts", Icon: "alert", Style: "success"}
 	}
 	b.render(ctx, v, sb.String(), inlineKeyboard(
-		[]btn{{toggleLabel, "monitor_toggle_alerts"}},
-		[]btn{{fmt.Sprintf("🚨 失败阈值：%d 次", after), "ask_monitor_after"},
-			{fmt.Sprintf("🔕 冷却：%d 分钟", cooldown), "ask_monitor_cooldown"}},
-		[]btn{{"« 返回健康监控", "health"}},
+		[]btn{{Text: fmt.Sprintf("阈值 %d 次", after), Data: "ask_monitor_after"},
+			{Text: fmt.Sprintf("冷却 %d 分钟", cooldown), Data: "ask_monitor_cooldown"}},
+		[]btn{toggle},
+		navRow("health"),
 	))
 }
