@@ -29,7 +29,7 @@ func (n *Node) MihomoConfig(socksPort int) (string, error) {
 	b.WriteString("mode: rule\n")
 	b.WriteString("log-level: warning\n")
 	b.WriteString("ipv6: false\n")
-		b.WriteString("profile:\n  store-selected: false\n  store-fake-ip: false\n")
+	b.WriteString("profile:\n  store-selected: false\n  store-fake-ip: false\n")
 	b.WriteString("\nproxies:\n")
 	b.WriteString(proxy)
 	b.WriteString("\nproxy-groups:\n")
