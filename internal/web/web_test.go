@@ -17,6 +17,7 @@ import (
 	"github.com/w0ven/5gpn-next/internal/config"
 	"github.com/w0ven/5gpn-next/internal/egress"
 	"github.com/w0ven/5gpn-next/internal/manage"
+	"github.com/w0ven/5gpn-next/internal/panelauth"
 	"github.com/w0ven/5gpn-next/internal/policy"
 	"github.com/w0ven/5gpn-next/internal/stats"
 	"github.com/w0ven/5gpn-next/internal/trace"
@@ -362,5 +363,61 @@ func TestAdBlockSuspectsExtrasAndBlock(t *testing.T) {
 	}
 	if code, _ := post(`{"action":"extra","key":"nope","enabled":true}`); code != http.StatusBadRequest {
 		t.Fatalf("未知附加列表应返回 400，实际 %d", code)
+	}
+}
+
+// TestWritesRequireLogin 查看免登录；修改必须先用一次性链接登录。
+func TestWritesRequireLogin(t *testing.T) {
+	panel, _ := testPanel(t)
+	panel.Auth = panelauth.New(t.TempDir())
+	h := panel.Handler()
+	write := func(cookie *http.Cookie) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "https://gateway.example/api/rules",
+			bytes.NewBufferString(`{"rule":"DOMAIN,a.example,block"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "https://gateway.example")
+		if cookie != nil {
+			req.AddCookie(cookie)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := write(nil); rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "login_required") {
+		t.Fatalf("未登录写请求应 401: %d %s", rec.Code, rec.Body.String())
+	}
+	get := httptest.NewRecorder()
+	h.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/api/rules", nil))
+	if get.Code != http.StatusOK {
+		t.Fatalf("查看不应要求登录: %d", get.Code)
+	}
+
+	tok, err := panel.Auth.IssueToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	login := httptest.NewRecorder()
+	h.ServeHTTP(login, httptest.NewRequest(http.MethodGet, "https://gateway.example/login?t="+tok, nil))
+	if login.Code != http.StatusFound {
+		t.Fatalf("登录应跳转: %d", login.Code)
+	}
+	var session *http.Cookie
+	for _, c := range login.Result().Cookies() {
+		if c.Name == panelauth.CookieName {
+			session = c
+		}
+	}
+	if session == nil || !session.HttpOnly || !session.Secure || session.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("会话 Cookie 不对: %+v", session)
+	}
+	if rec := write(session); rec.Code != http.StatusOK {
+		t.Fatalf("登录后写请求应成功: %d %s", rec.Code, rec.Body.String())
+	}
+
+	again := httptest.NewRecorder()
+	h.ServeHTTP(again, httptest.NewRequest(http.MethodGet, "https://gateway.example/login?t="+tok, nil))
+	if again.Code != http.StatusForbidden {
+		t.Fatalf("同一链接第二次应失效: %d", again.Code)
 	}
 }

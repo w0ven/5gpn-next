@@ -875,7 +875,9 @@ func (m *Manager) Probe(ctx context.Context, target string) *trace.Trace {
 	m.mu.RLock()
 	p := &probe.Prober{Policy: m.Policy, Egress: m.Egress}
 	m.mu.RUnlock()
-	return p.Run(ctx, NormalizeTarget(target))
+	// 诊断模拟的是手机经网关的访问，与接管入口一样不代连回环/内网地址；
+	// 面板查看免登录，不能借诊断让网关去连本机内部服务。
+	return p.Run(egress.PublicOnly(ctx), NormalizeTarget(target))
 }
 
 // NormalizeTarget 把用户输入清洗成 host[:port]。

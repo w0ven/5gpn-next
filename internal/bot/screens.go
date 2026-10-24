@@ -766,7 +766,7 @@ func (b *Bot) renderClient(ctx context.Context, v view, extra string) {
 	}
 	if b.PanelURL != "" {
 		sb.WriteString("\n" + ic("panel") + " <b>内网面板</b>\n")
-		sb.WriteString(card("<code>" + esc(b.PanelURL) + "</code>\n手机走内网卡时直接打开，无需登录。"))
+		sb.WriteString(card("<code>" + esc(b.PanelURL) + "</code>\n手机走内网卡时直接打开即可查看；要修改设置，点「面板登录」拿一次性链接（10 分钟内有效，登录后 30 天免登）。"))
 	}
 	sb.WriteString(extra)
 
@@ -774,10 +774,35 @@ func (b *Bot) renderClient(ctx context.Context, v view, extra string) {
 	if b.Manager.DNSProfileBytes != nil {
 		row = append(row, btn{Text: "iOS 描述文件", Data: "ios_dns_profile", Icon: "apple", Style: "primary"})
 	}
-	if b.PanelURL != "" {
-		row = append(row, btn{Text: "打开面板", Data: "url:" + b.PanelURL, Icon: "panel"})
+	var rows [][]btn
+	if len(row) > 0 {
+		rows = append(rows, row)
 	}
-	b.render(ctx, v, sb.String(), inlineKeyboard(row, navRow("menu")))
+	if b.PanelURL != "" {
+		panelRow := []btn{{Text: "打开面板", Data: "url:" + b.PanelURL, Icon: "panel"}}
+		if b.PanelLogin != nil {
+			panelRow = append(panelRow, btn{Text: "面板登录", Data: "panel_login"})
+		}
+		rows = append(rows, panelRow)
+	}
+	rows = append(rows, navRow("menu"))
+	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
+}
+
+// showPanelLogin 签发一次性面板登录链接。链接只放在按钮里、不出现在消息
+// 正文：Telegram 会抓取正文链接做预览，那一次访问就会把它用掉。
+func (b *Bot) showPanelLogin(ctx context.Context, v view) {
+	link, err := b.PanelLogin()
+	if err != nil {
+		b.fail(ctx, v, "生成登录链接失败", err, "client")
+		return
+	}
+	text := head("panel", "面板登录") +
+		card("点下面的按钮在手机浏览器里打开，即可在面板里修改设置。\n\n链接只能用一次，10 分钟内有效；登录后这台设备 30 天内不用再登录。") +
+		note("warn", "不要转发这个按钮：拿到链接的人就能修改网关设置。")
+	b.render(ctx, v, text, inlineKeyboard(
+		[]btn{{Text: "打开面板并登录", Data: "url:" + link, Icon: "panel", Style: "primary"}},
+		navRow("client")))
 }
 
 // sendDNSProfile 下发蜂窝 DNS 描述文件：先收起上次发的文件，再发二维码与文件，

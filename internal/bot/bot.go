@@ -41,6 +41,8 @@ type Bot struct {
 
 	// PanelURL 是内网面板地址，供菜单展示
 	PanelURL string
+	// PanelLogin 签发一次性面板登录链接（可为空：面板未启用登录）。
+	PanelLogin func() (string, error)
 
 	client *http.Client
 	offset int64
@@ -627,6 +629,8 @@ func (b *Bot) dispatch(ctx context.Context, v view, cmd string) {
 		b.showRules(ctx, v)
 	case "rulesets":
 		b.showRuleSets(ctx, v)
+	case "panel_login":
+		b.showPanelLogin(ctx, v)
 	case "rules_builtin":
 		b.showBuiltinRules(ctx, v)
 	case "ask_rule_add":

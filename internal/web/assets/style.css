@@ -335,6 +335,34 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   overflow-wrap: anywhere;
 }
 .rule-problem { color: var(--warn); font-size: 12px; margin-top: 2px; }
+.rs-head { margin-top: 22px; }
+.rs-title { font-weight: 650; font-size: 14px; }
+.rs-count { color: var(--ink-3); font: 500 12px var(--mono); margin-left: 8px; }
+.rs-meta { color: var(--ink-2); font-size: 12.5px; }
+.rs-ok { color: var(--ok); }
+.rs-bad { color: var(--warn); overflow-wrap: anywhere; }
+
+.session-chip {
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--ink-2);
+  border-radius: 999px;
+  padding: 5px 11px;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.session-chip.on { border-color: var(--accent-line); color: var(--accent-hover); background: var(--accent-soft); }
+.login-banner {
+  margin: 10px 0 0;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border: 1px solid #f6dfb8;
+  border-radius: 12px;
+  padding: 10px 14px;
+  font-size: 13px;
+}
+.login-banner code { font: 12px var(--mono); }
 .builtin-tag { color: var(--ink-3); font-size: 11.5px; white-space: nowrap; }
 
 .empty { color: var(--ink-3); font-size: 13px; margin: 8px 0; }

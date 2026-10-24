@@ -29,6 +29,7 @@ import (
 	"github.com/w0ven/5gpn-next/internal/manage"
 	"github.com/w0ven/5gpn-next/internal/monitor"
 	"github.com/w0ven/5gpn-next/internal/node"
+	"github.com/w0ven/5gpn-next/internal/panelauth"
 	"github.com/w0ven/5gpn-next/internal/policy"
 	"github.com/w0ven/5gpn-next/internal/probe"
 	"github.com/w0ven/5gpn-next/internal/profile"
@@ -61,6 +62,8 @@ func main() {
 		err = cmdProfile(args)
 	case "node-config":
 		err = cmdNodeConfig(args)
+	case "panel-login":
+		err = cmdPanelLogin(args)
 	case "check":
 		err = cmdCheck(args)
 	case "version", "-v", "--version":
@@ -85,6 +88,7 @@ func usage() {
   5gpnd profile -c <配置文件> -o <输出>   生成 iOS 描述文件
   5gpnd check   -c <配置文件>            校验配置（不启动服务）
   5gpnd node-config -link <文件> -out <文件>  由分享链接生成 mihomo 出口配置
+  5gpnd panel-login -c <配置文件>         生成一次性面板登录链接（无 Bot 时使用）
   5gpnd version
 
 说明:
@@ -635,6 +639,8 @@ func cmdRun(args []string) error {
 		}()
 	}
 
+	panelAuth := panelauth.New(panelauth.DefaultDir)
+
 	// 内网 Web 面板：挂在根路径，仅内网卡来源可达，无需登录
 	var panelHandler http.Handler
 	if a.cfg.Panel.Enabled {
@@ -642,6 +648,7 @@ func cmdRun(args []string) error {
 		if err != nil {
 			return fmt.Errorf("初始化面板失败: %w", err)
 		}
+		p.Auth = panelAuth
 		panelHandler = p.Handler()
 		log.Printf("内网面板已启用: https://%s:%d/（仅 %s 可访问）",
 			a.cfg.Gateway.Host, portOf(a.cfg.Gateway.Listen), a.cfg.ClientCIDR)
@@ -816,8 +823,14 @@ func cmdRun(args []string) error {
 			ncancel()
 		})
 		if panelHandler != nil {
-			tb.PanelURL = fmt.Sprintf("https://%s:%d/",
-				a.cfg.Gateway.Host, portOf(a.cfg.Gateway.Listen))
+			tb.PanelURL = panelURL(a.cfg)
+			tb.PanelLogin = func() (string, error) {
+				tok, err := panelAuth.IssueToken()
+				if err != nil {
+					return "", err
+				}
+				return tb.PanelURL + "login?t=" + tok, nil
+			}
 		}
 		go tb.Run(botCtx)
 
@@ -1100,6 +1113,27 @@ func cmdCheck(args []string) error {
 }
 
 // ---------- node-config ----------
+
+// cmdPanelLogin 在服务器上签发一次性面板登录链接，供没有配置 Bot 的部署使用。
+func cmdPanelLogin(args []string) error {
+	cfg, err := config.Load(flagValue(args, "-c", "/etc/5gpn-next/config.json"))
+	if err != nil {
+		return err
+	}
+	if !cfg.Panel.Enabled {
+		return fmt.Errorf("面板未启用（panel.enabled=false）")
+	}
+	tok, err := panelauth.New(panelauth.DefaultDir).IssueToken()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("用连着内网卡的手机在 10 分钟内打开（只能用一次）：\n%slogin?t=%s\n", panelURL(cfg), tok)
+	return nil
+}
+
+func panelURL(cfg *config.Config) string {
+	return fmt.Sprintf("https://%s:%d/", cfg.Gateway.Host, portOf(cfg.Gateway.Listen))
+}
 
 func cmdNodeConfig(args []string) error {
 	linkPath := flagValue(args, "-link", "")

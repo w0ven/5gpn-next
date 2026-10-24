@@ -18,6 +18,7 @@
     </a>
     <div class="topbar-meta">
       <span class="live"><i></i> 服务在线</span>
+      <button class="session-chip" id="session-chip" type="button" hidden></button>
       <span class="ver">{{.Version}}</span>
     </div>
   </div>
@@ -26,6 +27,7 @@
 <div class="wrap phead">
   <h1>管理面板</h1>
   <p>关键状态每 15 秒自动刷新 · <span class="uptime" id="hero-uptime">加载中…</span></p>
+  <p class="login-banner" id="login-banner" hidden>当前是<b>只读模式</b>。要修改设置，在 Telegram Bot 里打开「接入 → 面板登录」，用手机浏览器打开得到的链接；没有配置 Bot 时在服务器上运行 <code>5gpnd panel-login</code>。登录后这台设备 30 天内不用再登录。</p>
 </div>
 
 <main class="wrap">
@@ -82,6 +84,9 @@
       <div class="act"><button class="btn" id="rule-add" type="button">添加规则</button></div>
       <p class="hint"><b>类型：</b>DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、IP-CIDR、RULE-SET、GEOIP　·　<b>动作：</b>direct（手机直连，国内）、block（拦截）、proxy（默认出口）、proxy:出口名、proxy:DIRECT（网关本机直出）</p>
     </div>
+
+    <div class="subhead rs-head"><h3>规则集状态</h3><span>失败后每小时重试，连续 3 次失败经 Bot 提醒</span></div>
+    <div id="rulesets-list" class="rows"></div>
   </section>
 
   <section class="card" aria-labelledby="apps-title">

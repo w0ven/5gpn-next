@@ -23,9 +23,47 @@ async function api(path, opts) {
   let data = null;
   try { data = await res.json(); } catch (_) { /* 忽略非 JSON 响应 */ }
   if (!res.ok) {
+    if (res.status === 401 && data && data.login_required) renderSession({ required: true, logged_in: false });
     throw new Error((data && data.error) || ('请求失败 ' + res.status));
   }
   return data;
+}
+
+// ---------- 登录 ----------
+
+function renderSession(s) {
+  const chip = $('session-chip');
+  const banner = $('login-banner');
+  if (!s.required) {
+    chip.hidden = true;
+    banner.hidden = true;
+    return;
+  }
+  chip.hidden = false;
+  chip.textContent = s.logged_in ? '已登录' : '只读';
+  chip.className = 'session-chip' + (s.logged_in ? ' on' : '');
+  chip.title = s.logged_in ? '点击退出登录' : '查看如何登录';
+  banner.hidden = !!s.logged_in;
+  chip.onclick = async () => {
+    if (!s.logged_in) {
+      banner.hidden = false;
+      banner.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    if (!confirm('退出登录？退出后这台设备只能查看，修改需要重新获取登录链接。')) return;
+    try {
+      renderSession(Object.assign({ required: true }, await api('/api/session', { method: 'POST', body: '{}' })));
+      toast('已退出登录');
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+}
+
+async function loadSession() {
+  try {
+    renderSession(await api('/api/session'));
+  } catch (_) { /* 旧版网关没有该接口 */ }
 }
 
 function el(tag, cls, text) {
@@ -405,6 +443,44 @@ async function loadRules() {
   } catch (err) {
     toast(err.message, true);
   }
+  loadRuleSets();
+}
+
+function renderRuleSets(list) {
+  const box = $('rulesets-list');
+  box.textContent = '';
+  (list || []).forEach((rs) => {
+    const row = el('div', 'row');
+    const main = el('div', 'row-main');
+    const title = el('div', 'rs-title', rs.label);
+    if (rs.entries) title.appendChild(el('span', 'rs-count', number(rs.entries) + ' 条'));
+    main.appendChild(title);
+    let line;
+    if (rs.local) {
+      line = el('div', 'rs-meta', '本地文件，不联网更新');
+    } else if (rs.fails > 0) {
+      line = el('div', 'rs-meta rs-bad', '连续 ' + rs.fails + ' 次检查失败（最近 ' + relativeTime(rs.last_check) + '）：' + (rs.last_error || ''));
+    } else if (!rs.last_check) {
+      line = el('div', 'rs-meta', '尚未联网检查');
+    } else {
+      line = el('div', 'rs-meta rs-ok', '检查正常 · ' + relativeTime(rs.last_check));
+    }
+    main.appendChild(line);
+    if (!rs.local) {
+      const parts = [];
+      if (rs.updated) parts.push('内容更新于 ' + relativeTime(rs.updated));
+      parts.push(rs.interval_hours < 0 ? '不自动更新' : '每 ' + rs.interval_hours + ' 小时检查');
+      main.appendChild(el('div', 'rs-meta', parts.join(' · ')));
+    }
+    row.appendChild(main);
+    box.appendChild(row);
+  });
+}
+
+async function loadRuleSets() {
+  try {
+    renderRuleSets((await api('/api/rulesets')).rulesets);
+  } catch (_) { /* 状态加载失败不影响规则列表 */ }
 }
 
 // ---------- 应用分流 ----------
@@ -655,6 +731,7 @@ $('rule-input').addEventListener('keydown', (event) => {
   if (event.key === 'Enter') $('rule-add').click();
 });
 
+loadSession();
 loadStatus();
 loadRules();
 loadApps();

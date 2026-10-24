@@ -1,8 +1,8 @@
 // Package web 提供内网 Web 管理面板。
 //
 // 安全边界：面板只对内网卡来源开放 —— 应用层校验来源网段，
-// 外层再叠加 nftables 限制。公网无法连接，因此不设登录，
-// 手机连着内网卡打开域名即达。
+// 外层再叠加 nftables 限制。查看免登录；修改需要先用 Bot 或服务器
+// 命令行签发的一次性链接登录（客户端网段里不一定只有管理员的设备）。
 package web
 
 import (
@@ -25,6 +25,7 @@ import (
 
 	"github.com/w0ven/5gpn-next/internal/config"
 	"github.com/w0ven/5gpn-next/internal/manage"
+	"github.com/w0ven/5gpn-next/internal/panelauth"
 	"github.com/w0ven/5gpn-next/internal/trace"
 )
 
@@ -39,6 +40,9 @@ type Panel struct {
 	// AllowFrom 限定可访问的来源网段；为空时不做应用层限制
 	// （仍受 nftables 约束，但双重防护更稳妥）。
 	AllowFrom []netip.Prefix
+
+	// Auth 非空时，所有写请求都要求已登录。
+	Auth *panelauth.Store
 
 	tmpl *template.Template
 
@@ -89,6 +93,9 @@ func (p *Panel) Handler() http.Handler {
 	mux.HandleFunc("/app.js", p.serveAsset("assets/app.js", "application/javascript; charset=utf-8"))
 	mux.HandleFunc("/apps/", p.serveAppLogo)
 
+	mux.HandleFunc("/login", p.guard(p.handleLogin))
+	mux.HandleFunc("/api/session", p.apiGuard(p.apiSession))
+
 	// 兼容旧地址：/panel 一律跳回根
 	mux.HandleFunc("/panel", p.redirectRoot)
 	mux.HandleFunc("/panel/", p.redirectRoot)
@@ -97,6 +104,7 @@ func (p *Panel) Handler() http.Handler {
 	mux.HandleFunc("/api/status", p.apiGuard(p.apiStatus))
 	mux.HandleFunc("/api/adblock", p.apiGuard(p.apiAdBlock))
 	mux.HandleFunc("/api/rules", p.apiGuard(p.apiRules))
+	mux.HandleFunc("/api/rulesets", p.apiGuard(p.apiRuleSets))
 	mux.HandleFunc("/api/egress", p.apiGuard(p.apiEgress))
 	mux.HandleFunc("/api/probe", p.apiGuard(p.apiProbe))
 	mux.HandleFunc("/api/health", p.apiGuard(p.apiHealth))
@@ -166,8 +174,71 @@ func (p *Panel) apiGuard(next http.HandlerFunc) http.HandlerFunc {
 				writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "写请求必须使用 application/json"})
 				return
 			}
+			if r.URL.Path != "/api/session" && !p.loggedIn(r) {
+				writeJSON(w, http.StatusUnauthorized, map[string]any{
+					"error":          loginHint,
+					"login_required": true,
+				})
+				return
+			}
 		}
 		next(w, r)
+	}
+}
+
+const loginHint = "修改设置需要先登录：在 Telegram Bot 里点「面板登录」，或在服务器上运行 5gpnd panel-login，打开得到的链接"
+
+func (p *Panel) loggedIn(r *http.Request) bool {
+	if p.Auth == nil {
+		return true
+	}
+	c, err := r.Cookie(panelauth.CookieName)
+	return err == nil && p.Auth.Valid(c.Value)
+}
+
+// handleLogin 兑换一次性登录链接，写入会话 Cookie 后回到首页。
+func (p *Panel) handleLogin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if p.Auth == nil {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	sid, err := p.Auth.Redeem(r.URL.Query().Get("t"))
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">`+
+			`<title>登录链接已失效</title><body style="font:16px/1.6 system-ui,sans-serif;padding:32px;max-width:520px;margin:auto">`+
+			`<h2>登录链接已失效</h2><p>每个链接只能用一次，10 分钟内有效。请在 Telegram Bot 里重新点「面板登录」。</p>`+
+			`<p><a href="/">返回面板（只读）</a></p>`)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     panelauth.CookieName,
+		Value:    sid,
+		Path:     "/",
+		MaxAge:   int(panelauth.SessionTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	})
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// apiSession 查询登录状态；POST {"action":"logout"} 退出登录。
+func (p *Panel) apiSession(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{"logged_in": p.loggedIn(r), "required": p.Auth != nil, "hint": loginHint})
+	case http.MethodPost:
+		if c, err := r.Cookie(panelauth.CookieName); err == nil && p.Auth != nil {
+			p.Auth.Revoke(c.Value)
+		}
+		http.SetCookie(w, &http.Cookie{Name: panelauth.CookieName, Value: "", Path: "/", MaxAge: -1,
+			HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
+		writeJSON(w, http.StatusOK, map[string]any{"logged_in": false})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "方法不支持"})
 	}
 }
 
@@ -442,6 +513,35 @@ func (p *Panel) apiRules(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "方法不支持"})
 	}
+}
+
+// apiRuleSets 返回各规则集的条目数、内容更新时间与最近一次检查结果。
+func (p *Panel) apiRuleSets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "方法不支持"})
+		return
+	}
+	unix := func(t time.Time) int64 {
+		if t.IsZero() {
+			return 0
+		}
+		return t.Unix()
+	}
+	var out []map[string]any
+	for _, st := range p.Manager.RuleSetStates() {
+		out = append(out, map[string]any{
+			"name":           st.Name,
+			"label":          st.Label,
+			"entries":        st.Entries,
+			"updated":        unix(st.Updated),
+			"last_check":     unix(st.Check.LastCheck),
+			"fails":          st.Check.Fails,
+			"last_error":     st.Check.LastError,
+			"interval_hours": st.IntervalHours,
+			"local":          st.Local,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rulesets": out})
 }
 
 func (p *Panel) apiEgress(w http.ResponseWriter, r *http.Request) {
