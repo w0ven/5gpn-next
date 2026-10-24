@@ -475,6 +475,11 @@ func cmdRun(args []string) error {
 	// 而蜂窝多为 v6 环境（WhatsApp 优先连 Meta IPv6 字面量）。
 	// 启动后实测一次 SOCKS ATYP=4 代拨能力，变化则持久化并热重载。
 	go func() {
+		// 旧版生成的出口配置开着无密码的控制接口，升级后去掉并重启实例；
+		// 必须先于 IPv6 探测，否则探测会撞上正在重启的实例而误判。
+		if restarted := mgr.StripMihomoController(); len(restarted) > 0 {
+			log.Printf("已关闭出口实例的控制接口: %s", strings.Join(restarted, ", "))
+		}
 		time.Sleep(3 * time.Second) // 等 mihomo 实例就绪
 		changed, err := mgr.RefreshEgressIPv6(4 * time.Second)
 		if err != nil {

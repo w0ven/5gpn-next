@@ -486,22 +486,28 @@ if [ -n "$NODE" ]; then
   fi
   ok "mihomo $(/usr/local/bin/mihomo -v 2>&1 | sed -n '1p' | awk '{print $3}')"
 
-  install -d -m 700 /etc/mihomo-5gpn
-  install -d -m 750 /var/lib/mihomo-5gpn
+  # 与运行期添加的出口完全一致：模板实例 mihomo-5gpn@<出口名>，配置放
+  # /var/lib/mihomo-5gpn/<出口名>。旧版的独立 mihomo-5gpn.service 删除出口时
+  # 不会被停掉，再加新节点会复用同一端口，流量悄悄继续走旧节点。
+  install -d -m 750 /var/lib/mihomo-5gpn /var/lib/mihomo-5gpn/node
 
   /usr/local/bin/5gpnd node-config \
     -link "$CFGDIR/node.link" \
-    -out /etc/mihomo-5gpn/config.yaml \
+    -out /var/lib/mihomo-5gpn/node/config.yaml \
     -socks 7891 || die "节点链接解析失败，请检查格式"
-  chmod 600 /etc/mihomo-5gpn/config.yaml
+  chmod 600 /var/lib/mihomo-5gpn/node/config.yaml
 
-  /usr/local/bin/mihomo -t -d /var/lib/mihomo-5gpn -f /etc/mihomo-5gpn/config.yaml >/dev/null 2>&1 \
+  /usr/local/bin/mihomo -t -d /var/lib/mihomo-5gpn/node -f /var/lib/mihomo-5gpn/node/config.yaml >/dev/null 2>&1 \
     || die "mihomo 配置校验失败"
 
-  cat > /etc/systemd/system/mihomo-5gpn.service <<'EOF'
+  if [ -f /etc/systemd/system/mihomo-5gpn.service ]; then
+    systemctl disable --now mihomo-5gpn.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/mihomo-5gpn.service
+  fi
+
+  cat > /etc/systemd/system/mihomo-5gpn@.service <<'EOF'
 [Unit]
-Description=mihomo egress for 5gpn-next
-Documentation=https://github.com/MetaCubeX/mihomo
+Description=mihomo egress %i for 5gpn-next
 After=network-online.target
 Wants=network-online.target
 StartLimitBurst=10
@@ -509,7 +515,7 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/mihomo -d /var/lib/mihomo-5gpn -f /etc/mihomo-5gpn/config.yaml
+ExecStart=/usr/local/bin/mihomo -d /var/lib/mihomo-5gpn/%i -f /var/lib/mihomo-5gpn/%i/config.yaml
 Restart=on-failure
 RestartSec=3s
 NoNewPrivileges=true
@@ -537,9 +543,9 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now mihomo-5gpn.service >/dev/null 2>&1
+  systemctl enable --now mihomo-5gpn@node.service >/dev/null 2>&1
   sleep 2
-  systemctl is-active --quiet mihomo-5gpn.service || die "mihomo 启动失败：journalctl -u mihomo-5gpn -n 30"
+  systemctl is-active --quiet mihomo-5gpn@node.service || die "mihomo 启动失败：journalctl -u mihomo-5gpn@node -n 30"
 
   EXIT_IP=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:7891 https://api.ipify.org 2>/dev/null || echo "")
   if [ -n "$EXIT_IP" ] && [ "$EXIT_IP" != "$PUBIP" ]; then

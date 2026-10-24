@@ -143,3 +143,40 @@ func TestMihomoConfigSSSmoke(t *testing.T) {
 		}
 	}
 }
+
+// TestParseRejectsInjectedFields 链接字段经 URL 解码后可带换行，不得据此
+// 往 mihomo 配置里塞进额外的顶层配置项。
+func TestParseRejectsInjectedFields(t *testing.T) {
+	for _, link := range []string{
+		"trojan://pw@1.2.3.4:443?sni=a.com%0Alisteners:%0A-%20name:%20open#demo",
+		"vless://uuid-1@1.2.3.4:443?security=tls&type=ws&host=a.com%0Ax:%20y#demo",
+		"vless://uuid%0Ax@1.2.3.4:443?security=tls#demo",
+		"trojan://pw@a.com%20b:443#demo",
+	} {
+		if _, err := Parse(link); err == nil {
+			t.Errorf("应拒绝: %s", link)
+		}
+	}
+}
+
+// TestMihomoConfigEscapesEveryString 即便绕过解析校验，渲染也不能被换行破坏结构。
+func TestMihomoConfigEscapesEveryString(t *testing.T) {
+	n := &Node{Type: "trojan", Server: "1.2.3.4", Port: 443, Password: "p\nw",
+		SNI: "a.com\nlisteners:", ClientFP: "chrome\n", ALPN: []string{"h2\n- x"},
+		Network: "ws", WSPath: "/p\n", WSHost: "h\nk: v"}
+	y, err := n.MihomoConfig(7891)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(y, "\n") {
+		if strings.HasPrefix(line, "listeners") || strings.HasPrefix(line, "k:") || strings.HasPrefix(line, "- x") {
+			t.Fatalf("出现注入行 %q:\n%s", line, y)
+		}
+	}
+	if strings.Contains(y, "external-controller") {
+		t.Fatalf("不应再开放控制接口:\n%s", y)
+	}
+	if !strings.Contains(y, `servername: "a.com\x0alisteners:"`) {
+		t.Fatalf("servername 未转义:\n%s", y)
+	}
+}

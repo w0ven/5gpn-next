@@ -29,8 +29,7 @@ func (n *Node) MihomoConfig(socksPort int) (string, error) {
 	b.WriteString("mode: rule\n")
 	b.WriteString("log-level: warning\n")
 	b.WriteString("ipv6: false\n")
-	b.WriteString("external-controller: 127.0.0.1:9095\n")
-	b.WriteString("profile:\n  store-selected: false\n  store-fake-ip: false\n")
+		b.WriteString("profile:\n  store-selected: false\n  store-fake-ip: false\n")
 	b.WriteString("\nproxies:\n")
 	b.WriteString(proxy)
 	b.WriteString("\nproxy-groups:\n")
@@ -47,25 +46,25 @@ func (n *Node) mihomoProxy() (string, error) {
 
 	w("  - name: \"node\"\n")
 	w("    type: %s\n", n.Type)
-	w("    server: %s\n", n.Server)
+	w("    server: %s\n", yamlStr(n.Server))
 	w("    port: %d\n", n.Port)
 
 	switch n.Type {
 	case "ss":
-		w("    cipher: %s\n", n.Cipher)
+		w("    cipher: %s\n", yamlStr(n.Cipher))
 		w("    password: %s\n", yamlStr(n.Password))
 
 	case "vless":
-		w("    uuid: %s\n", n.UUID)
+		w("    uuid: %s\n", yamlStr(n.UUID))
 		w("    tls: %t\n", n.TLS)
 		if n.Flow != "" {
-			w("    flow: %s\n", n.Flow)
+			w("    flow: %s\n", yamlStr(n.Flow))
 		}
 		if n.Security == "reality" {
 			if n.PublicKey == "" {
 				return "", fmt.Errorf("reality 节点缺少 pbk 公钥参数")
 			}
-			w("    reality-opts:\n      public-key: %s\n", n.PublicKey)
+			w("    reality-opts:\n      public-key: %s\n", yamlStr(n.PublicKey))
 			if n.ShortID != "" {
 				w("      short-id: %s\n", yamlStr(n.ShortID))
 			}
@@ -74,9 +73,9 @@ func (n *Node) mihomoProxy() (string, error) {
 		n.writeNetwork(w)
 
 	case "vmess":
-		w("    uuid: %s\n", n.UUID)
+		w("    uuid: %s\n", yamlStr(n.UUID))
 		w("    alterId: %d\n", n.AlterID)
-		w("    cipher: %s\n", orDef(n.Security, "auto"))
+		w("    cipher: %s\n", yamlStr(orDef(n.Security, "auto")))
 		w("    tls: %t\n", n.TLS)
 		n.writeTLSCommon(w)
 		n.writeNetwork(w)
@@ -91,7 +90,7 @@ func (n *Node) mihomoProxy() (string, error) {
 		n.writeTLSCommon(w)
 
 	case "tuic":
-		w("    uuid: %s\n", n.UUID)
+		w("    uuid: %s\n", yamlStr(n.UUID))
 		w("    password: %s\n", yamlStr(n.Password))
 		n.writeTLSCommon(w)
 
@@ -116,18 +115,18 @@ func (n *Node) mihomoProxy() (string, error) {
 
 func (n *Node) writeTLSCommon(w func(string, ...any)) {
 	if n.SNI != "" {
-		w("    servername: %s\n", n.SNI)
+		w("    servername: %s\n", yamlStr(n.SNI))
 	}
 	if n.SkipCertVerify {
 		w("    skip-cert-verify: true\n")
 	}
 	if n.ClientFP != "" {
-		w("    client-fingerprint: %s\n", n.ClientFP)
+		w("    client-fingerprint: %s\n", yamlStr(n.ClientFP))
 	}
 	if len(n.ALPN) > 0 {
 		w("    alpn:\n")
 		for _, a := range n.ALPN {
-			w("      - %s\n", strings.TrimSpace(a))
+			w("      - %s\n", yamlStr(strings.TrimSpace(a)))
 		}
 	}
 }
@@ -138,7 +137,7 @@ func (n *Node) writeNetwork(w func(string, ...any)) {
 		w("    network: ws\n    ws-opts:\n")
 		w("      path: %s\n", yamlStr(orDef(n.WSPath, "/")))
 		if n.WSHost != "" {
-			w("      headers:\n        Host: %s\n", n.WSHost)
+			w("      headers:\n        Host: %s\n", yamlStr(n.WSHost))
 		}
 	case "grpc":
 		w("    network: grpc\n")
@@ -148,13 +147,31 @@ func (n *Node) writeNetwork(w func(string, ...any)) {
 	case "", "tcp":
 		// 默认，无需显式声明
 	default:
-		w("    network: %s\n", n.Network)
+		w("    network: %s\n", yamlStr(n.Network))
 	}
 }
 
-// yamlStr 安全地引用字符串，避免密码中的特殊字符破坏 YAML。
+// yamlStr 把任意字符串渲染成 YAML 双引号标量。
+//
+// 链接字段都来自外部（机场下发、群里转发），经 URL 解码后可能带换行；
+// 原样写进配置就能注入额外的顶层配置项。控制字符一律转义成 \xNN。
 func yamlStr(s string) string {
-	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch {
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == '"':
+			b.WriteString(`\"`)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // Redacted 返回可安全打印的摘要，绝不含密钥。

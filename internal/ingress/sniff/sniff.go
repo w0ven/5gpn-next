@@ -259,7 +259,7 @@ func (s *Server) handle(ctx context.Context, cli net.Conn, isTLS bool) {
 	}
 	tr.Step(trace.StageEgress, trace.StatusOK, "%s", dialer.Name())
 
-	dctx, cancel := context.WithTimeout(ctx, egress.DialTimeout)
+	dctx, cancel := context.WithTimeout(egress.PublicOnly(ctx), egress.DialTimeout)
 	defer cancel()
 	dialStart := time.Now()
 	up, err := dialer.DialContext(dctx, "tcp", target)
@@ -349,6 +349,10 @@ func portOfConn(c net.Conn) int {
 }
 
 // peekHost 从首包解析目标域名，且不消费缓冲。
+//
+// 目标端口只由协议决定：客户端只有在想连 80/443 时才会落到这两个接管
+// 端口。采信 Host 头里的端口会让任何客户端用 Host: 127.0.0.1:9095 之类
+// 的请求借网关访问任意端口。
 func peekHost(br *bufio.Reader, isTLS bool) (string, int, error) {
 	if isTLS {
 		h, err := peekSNI(br)
@@ -361,11 +365,13 @@ func peekHost(br *bufio.Reader, isTLS bool) (string, int, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	if i := strings.LastIndex(h, ":"); i > 0 {
-		p := atoiSafe(h[i+1:])
-		if p > 0 {
-			return h[:i], p, nil
-		}
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		h = host
+	} else if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		h = h[1 : len(h)-1]
+	}
+	if h == "" {
+		return "", 0, ErrNoHost
 	}
 	return h, 80, nil
 }
@@ -571,17 +577,6 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b[i:])
-}
-
-func atoiSafe(s string) int {
-	n := 0
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return 0
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n
 }
 
 func minInt(a, b int) int {

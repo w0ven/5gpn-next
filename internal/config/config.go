@@ -6,7 +6,6 @@ package config
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -644,9 +643,19 @@ func (c *Config) Save(path string) error {
 	return WriteFileSandboxSafe(path, append(b, '\n'), 0o600)
 }
 
+var runSystemd = func(ctx context.Context, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, "systemd-run", args...).CombinedOutput()
+}
+
+// SandboxStageDir 是服务沙箱内外都能访问的暂存目录：服务开启了
+// PrivateTmp，沙箱外的 systemd-run 看不到私有 /tmp。
+var SandboxStageDir = "/var/lib/5gpn-next"
+
 // WriteFileSandboxSafe 原子写文件；沙箱内目标路径只读时，
 // 经 systemd-run 由 PID 1 在沙箱外代写（与自升级同一通道）。
-// 内容以 base64 传递，避免任何引号/转义问题。
+//
+// 内容先落到暂存文件再交给沙箱外进程，绝不放进命令行：systemd 会把
+// transient unit 的完整命令行写进日志，配置里含 Bot 令牌。
 func WriteFileSandboxSafe(path string, data []byte, mode os.FileMode) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, mode); err == nil {
@@ -656,21 +665,41 @@ func WriteFileSandboxSafe(path string, data []byte, mode os.FileMode) error {
 		_ = os.Remove(tmp)
 	}
 
-	b64 := base64.StdEncoding.EncodeToString(data)
-	script := fmt.Sprintf(
-		"echo %s | base64 -d > %q && chmod %o %q && mv -f %q %q",
-		b64, tmp, mode, tmp, tmp, path)
+	if err := os.MkdirAll(SandboxStageDir, 0o750); err != nil {
+		return fmt.Errorf("写入 %s 失败（暂存目录不可用）: %w", path, err)
+	}
+	f, err := os.CreateTemp(SandboxStageDir, ".stage-*")
+	if err != nil {
+		return fmt.Errorf("写入 %s 失败（暂存文件不可用）: %w", path, err)
+	}
+	stage := f.Name()
+	defer os.Remove(stage)
+	_, werr := f.Write(data)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		return fmt.Errorf("写入 %s 失败（暂存文件不可用）: %w", path, werr)
+	}
+
+	script := fmt.Sprintf("install -m %o %s %s && mv -f %s %s",
+		mode, shellQuote(stage), shellQuote(tmp), shellQuote(tmp), shellQuote(path))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "systemd-run",
+	out, err := runSystemd(ctx,
 		"--quiet", "--wait", "--collect",
 		"--property=Type=oneshot",
-		"/bin/sh", "-c", script).CombinedOutput()
+		"--description=5gpn-next 写入 "+path,
+		"/bin/sh", "-c", script)
 	if err != nil {
 		return fmt.Errorf("写入 %s 失败（沙箱外代写也失败）: %v: %s",
 			path, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // Validate 做基本校验。

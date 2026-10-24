@@ -60,6 +60,9 @@ func (d *Direct) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
 	if IsSelfTakeover(addr) {
 		return nil, ErrSelfConnect
 	}
+	if err := guardPublicLiteral(ctx, addr); err != nil {
+		return nil, err
+	}
 	if err := guardIPv6(addr, d.hasV6); err != nil {
 		return nil, err
 	}
@@ -95,6 +98,9 @@ func (s *Socks5) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
 	// SOCKS5 UDP 的目标域名由上游解析，必须在封装请求前先挡住网关自身。
 	if IsSelfTakeover(addr) {
 		return nil, ErrSelfConnect
+	}
+	if err := guardPublicLiteral(ctx, addr); err != nil {
+		return nil, err
 	}
 	if err := guardIPv6(addr, s.hasV6); err != nil {
 		return nil, err

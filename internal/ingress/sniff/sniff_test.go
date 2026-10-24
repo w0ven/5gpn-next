@@ -2,12 +2,17 @@ package sniff
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"net"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/w0ven/5gpn-next/internal/egress"
+	"github.com/w0ven/5gpn-next/internal/policy"
 )
 
 func TestAllowedClientEnforcesConfiguredCIDR(t *testing.T) {
@@ -117,16 +122,74 @@ func TestPeekHTTPHostHeaderSplitAcrossSegments(t *testing.T) {
 	}
 }
 
-// TestPeekHTTPHostPortInHost Host 带端口时应拆出端口。
-func TestPeekHTTPHostPortInHost(t *testing.T) {
-	br := bufio.NewReaderSize(strings.NewReader(
-		"GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"), 8*1024)
-	h, p, err := peekHost(br, false)
-	if err != nil {
-		t.Fatalf("解析失败: %v", err)
+// TestPeekHTTPHostIgnoresPortInHost Host 里的端口不能决定目标端口：
+// 否则客户端可借 HTTP 接管入口访问网关本机任意端口。
+func TestPeekHTTPHostIgnoresPortInHost(t *testing.T) {
+	cases := map[string]string{
+		"example.com:8080": "example.com",
+		"127.0.0.1:9095":   "127.0.0.1",
+		"[::1]:9095":       "::1",
+		"[::1]":            "::1",
+		"example.com":      "example.com",
 	}
-	if h != "example.com" || p != 8080 {
-		t.Fatalf("得到 %s:%d, 期望 example.com:8080", h, p)
+	for in, wantHost := range cases {
+		br := bufio.NewReaderSize(strings.NewReader(
+			"GET / HTTP/1.1\r\nHost: "+in+"\r\n\r\n"), 8*1024)
+		h, p, err := peekHost(br, false)
+		if err != nil {
+			t.Fatalf("%s: 解析失败: %v", in, err)
+		}
+		if h != wantHost || p != 80 {
+			t.Fatalf("%s: 得到 %s:%d, 期望 %s:80", in, h, p, wantHost)
+		}
+	}
+}
+
+// TestHandleRefusesLoopbackTarget 接管入口不得替客户端连接网关本机回环服务。
+func TestHandleRefusesLoopbackTarget(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var accepted atomic.Int32
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			c.Close()
+		}
+	}()
+
+	eng := policy.New()
+	reg := egress.NewRegistry()
+	s := &Server{
+		Policy: func() *policy.Engine { return eng },
+		Egress: func() *egress.Registry { return reg },
+	}
+	for _, host := range []string{ln.Addr().String(), "127.0.0.1", "169.254.169.254", "[::1]:80"} {
+		cli, srv := net.Pipe()
+		done := make(chan struct{})
+		go func() {
+			s.handle(context.Background(), srv, false)
+			close(done)
+		}()
+		_, _ = cli.Write([]byte("GET / HTTP/1.1\r\nHost: " + host + "\r\n\r\n"))
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: handle 未结束", host)
+		}
+		cli.Close()
+	}
+	if n := accepted.Load(); n != 0 {
+		t.Fatalf("回环服务被连接了 %d 次", n)
+	}
+	if got := s.Failed.Load(); got != 4 {
+		t.Fatalf("Failed = %d, 期望 4", got)
 	}
 }
 
