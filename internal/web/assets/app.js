@@ -386,9 +386,24 @@ async function setApp(a, sel) {
   }
 }
 
-function windowText(since) {
-  const minutes = Math.max(1, Math.round((Date.now() - Date.parse(since)) / 60000));
-  return minutes < 60 ? '最近 ' + minutes + ' 分钟' : '最近 ' + Math.round(minutes / 60) + ' 小时';
+function windowText(r) {
+  const minutes = Math.max(1, Math.round((Date.now() - Date.parse(r.since)) / 60000));
+  const ago = minutes < 60 ? minutes + ' 分钟' : Math.round(minutes / 60) + ' 小时';
+  if (r.since_kind === 'changed') return '改出口后 ' + ago;
+  if (r.since_kind === 'started') return '网关启动后 ' + ago;
+  return '最近 ' + ago;
+}
+
+function routeRows(box, list) {
+  for (const r of list) {
+    const row = el('div', 'check-row');
+    const mark = r.blocked ? '⊘ ' : r.ok ? '✓ ' : '✗ ';
+    const host = el('span', 'check-host' + (r.ok ? '' : ' bad'), mark + r.host);
+    if (!r.ok && r.rule) host.appendChild(el('span', 'check-rule', r.rule));
+    row.appendChild(host);
+    row.appendChild(el('span', 'check-eg', r.blocked ? '广告拦截' : egressNames[r.egress] || r.egress));
+    box.appendChild(row);
+  }
 }
 
 function egressText(map) {
@@ -417,11 +432,21 @@ async function checkApp(a) {
   try {
     const r = await api('/api/apps/check?key=' + encodeURIComponent(a.key));
     box.textContent = '';
-    box.appendChild(el('h3', null, a.name + ' · 选定 ' + r.egress_display + ' · ' + windowText(r.since)));
+    box.appendChild(el('h3', null, a.name + ' · 选定 ' + r.egress_display));
+    const current = r.current || [];
+    if (current.length) {
+      const blocked = current.filter((x) => x.blocked).length;
+      box.appendChild(r.current_mismatch
+        ? el('p', 'verdict bad', '按当前规则：' + r.current_mismatch + ' 个域名不走 ' + r.egress_display + '，灰字是命中的规则')
+        : el('p', 'verdict', '按当前规则：' + (current.length - blocked) + ' 个域名全部走 ' + r.egress_display +
+            (blocked ? '，' + blocked + ' 个广告域名被拦截' : '') + ' ✓'));
+      routeRows(box, current);
+    }
     const domains = r.domains || [];
     const suspects = r.suspects || [];
+    box.appendChild(el('p', 'verdict', '实际连接 · ' + windowText(r)));
     if (!domains.length) {
-      box.appendChild(el('p', 'empty', '这段时间还没有 ' + a.name + ' 的转发记录。用手机打开 ' + a.name + ' 用一会儿再核对。'));
+      box.appendChild(el('p', 'empty', '还没有 ' + a.name + ' 的连接。手机走内网卡打开 ' + a.name + ' 用一会儿，再来核对。'));
     } else if (r.mismatch) {
       box.appendChild(el('p', 'verdict bad', r.mismatch + ' 个域名有连接没走 ' + r.egress_display + '，灰字是当时命中的规则'));
     } else {

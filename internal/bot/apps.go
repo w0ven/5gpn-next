@@ -141,19 +141,39 @@ func (b *Bot) showAppCheck(ctx context.Context, v view, key string) {
 	for _, c := range b.Manager.AppEgressChoices() {
 		names[c[0]] = c[1]
 	}
+	eg := esc(res.EgressDisplay)
 
 	var sb strings.Builder
-	sb.WriteString(appLogo(st) + " <b>" + esc(st.Name) + " · 分流核对</b>\n")
-	fmt.Fprintf(&sb, "<i>%s · 选定 %s</i>\n", sinceText(res.Since), esc(res.EgressDisplay))
+	sb.WriteString(appLogo(st) + " <b>" + esc(st.Name) + " · 分流核对</b>　<i>选定 " + eg + "</i>\n")
+
+	if len(res.Current) > 0 {
+		blocked := 0
+		for _, r := range res.Current {
+			if r.Blocked {
+				blocked++
+			}
+		}
+		if res.CurrentMismatch > 0 {
+			fmt.Fprintf(&sb, "\n%s <b>按当前规则</b>　%d 个域名不走 %s\n", ic("warn"), res.CurrentMismatch, eg)
+		} else {
+			fmt.Fprintf(&sb, "\n%s <b>按当前规则</b>　%d 个域名全部走 %s", ic("ok"), len(res.Current)-blocked, eg)
+			if blocked > 0 {
+				fmt.Fprintf(&sb, "，%d 个广告域名被拦截", blocked)
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString(routeCard(res.Current, names))
+	}
+
+	fmt.Fprintf(&sb, "\n<b>实际连接</b>　<i>%s</i>\n", windowLabel(res))
 	switch {
 	case len(res.Domains) == 0:
-		sb.WriteString(card(fmt.Sprintf("这段时间还没有 %s 的转发记录。\n用手机打开 %s 用一会儿再来核对。", esc(st.Name), esc(st.Name))))
+		sb.WriteString(card(fmt.Sprintf("还没有 %s 的连接。手机走内网卡打开 %s 用一会儿，再来核对。", esc(st.Name), esc(st.Name))))
 	case res.Mismatch > 0:
-		sb.WriteString(ic("warn") + fmt.Sprintf(" <b>%d</b> 个域名有连接没走 %s\n", res.Mismatch, esc(res.EgressDisplay)))
+		fmt.Fprintf(&sb, "%s <b>%d</b> 个域名有连接没走 %s\n", ic("warn"), res.Mismatch, eg)
+		sb.WriteString(checkCard(res.Domains, names))
 	default:
-		sb.WriteString(ic("ok") + fmt.Sprintf(" <b>%d</b> 个域名全部经 %s\n", len(res.Domains), esc(res.EgressDisplay)))
-	}
-	if len(res.Domains) > 0 {
+		fmt.Fprintf(&sb, "%s <b>%d</b> 个域名全部经 %s\n", ic("ok"), len(res.Domains), eg)
 		sb.WriteString(checkCard(res.Domains, names))
 	}
 	if len(res.Suspects) > 0 {
@@ -166,6 +186,28 @@ func (b *Bot) showAppCheck(ctx context.Context, v view, key string) {
 		[]btn{{Text: "重新核对", Data: "app_check:" + key}},
 		navRow("app:"+key),
 	))
+}
+
+// routeCard 渲染按当前规则的判定：✓ 走选定出口，✗ 被其它规则截走，⊘ 被拦截。
+func routeCard(list []manage.AppRoute, names map[string]string) string {
+	var sb strings.Builder
+	sb.WriteString("<blockquote expandable>")
+	for i, r := range list {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		switch {
+		case r.Blocked:
+			fmt.Fprintf(&sb, "⊘ <code>%s</code>　广告拦截", esc(r.Host))
+		case r.OK:
+			fmt.Fprintf(&sb, "✓ <code>%s</code>", esc(r.Host))
+		default:
+			fmt.Fprintf(&sb, "✗ <code>%s</code>　→ %s\n　<i>%s</i>", esc(r.Host),
+				esc(orDefault(names[r.Egress], r.Egress)), esc(r.Rule))
+		}
+	}
+	sb.WriteString("</blockquote>\n")
+	return sb.String()
 }
 
 func checkCard(list []manage.AppDomain, names map[string]string) string {
@@ -210,10 +252,21 @@ func egressCounts(m map[string]int, names map[string]string) string {
 	return strings.Join(parts, " ")
 }
 
-func sinceText(t time.Time) string {
-	d := time.Since(t)
-	if d < time.Hour {
-		return fmt.Sprintf("最近 %d 分钟", max(1, int(d.Minutes())))
+// windowLabel 说明「实际连接」统计的起点。
+func windowLabel(res manage.AppCheck) string {
+	ago := agoText(time.Since(res.Since))
+	switch res.SinceKind {
+	case manage.SinceChanged:
+		return "改出口后 " + ago
+	case manage.SinceStarted:
+		return "网关启动后 " + ago
 	}
-	return fmt.Sprintf("最近 %d 小时", int(d.Hours()+0.5))
+	return "最近 " + ago
+}
+
+func agoText(d time.Duration) string {
+	if d < time.Hour {
+		return fmt.Sprintf("%d 分钟", max(1, int(d.Minutes())))
+	}
+	return fmt.Sprintf("%d 小时", int(d.Hours()+0.5))
 }
