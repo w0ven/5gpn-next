@@ -125,7 +125,7 @@ func egressHealthLine(e monitor.EgressHealth) string {
 		sb.WriteString("暂无数据")
 	}
 	if !e.Probe1h.LastFailAt.IsZero() {
-		fmt.Fprintf(&sb, "\n上次失败　%s", e.Probe1h.LastFailAt.Local().Format("15:04:05"))
+		fmt.Fprintf(&sb, "\n上次失败　%s", e.Probe1h.LastFailAt.In(beijing).Format("15:04:05"))
 	}
 	sb.WriteString("</blockquote>\n")
 	return sb.String()
@@ -146,9 +146,9 @@ func (b *Bot) showHealthDetail(ctx context.Context, v view, name string) {
 				lines.WriteString("\n")
 			}
 			if s.OK {
-				fmt.Fprintf(&lines, "🐢 %s　<b>%s</b> 慢", s.At.Local().Format("01-02 15:04"), monitor.FormatUS(s.US))
+				fmt.Fprintf(&lines, "🐢 %s　<b>%s</b> 慢", s.At.In(beijing).Format("01-02 15:04"), monitor.FormatUS(s.US))
 			} else {
-				fmt.Fprintf(&lines, "🔴 %s　<b>失败</b>", s.At.Local().Format("01-02 15:04"))
+				fmt.Fprintf(&lines, "🔴 %s　<b>失败</b>", s.At.In(beijing).Format("01-02 15:04"))
 			}
 		}
 		sb.WriteString(card(lines.String()))

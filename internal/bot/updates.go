@@ -29,7 +29,7 @@ func (b *Bot) renderUpdate(ctx context.Context, v view, extra string) {
 		newTag = rel.Tag
 		fmt.Fprintf(&info, "\n最新　<b>%s</b>", esc(rel.Tag))
 		if !rel.Published.IsZero() {
-			fmt.Fprintf(&info, "　<i>%s 发布</i>", rel.Published.Local().Format("01-02 15:04"))
+			fmt.Fprintf(&info, "　<i>%s 发布</i>", rel.Published.In(beijing).Format("01-02 15:04"))
 		}
 	case b.Manager.IsIgnoredVersion(rel.Tag) && rel.Tag != b.Version:
 		fmt.Fprintf(&info, "\n最新　<code>%s</code>　<i>已忽略</i>", esc(rel.Tag))
@@ -37,7 +37,7 @@ func (b *Bot) renderUpdate(ctx context.Context, v view, extra string) {
 		info.WriteString("\n" + ic("ok") + " 已是最新")
 	}
 	if hasCache {
-		fmt.Fprintf(&info, "\n<i>检查于 %s</i>", checkedAt.Local().Format("01-02 15:04"))
+		fmt.Fprintf(&info, "\n<i>检查于 %s</i>", checkedAt.In(beijing).Format("01-02 15:04"))
 	}
 	sb.WriteString(card(info.String()))
 	if newTag != "" {
@@ -104,7 +104,7 @@ func (b *Bot) showUpdateSettings(ctx context.Context, v view) {
 			}
 			fmt.Fprintf(&lines, "<code>%s</code>　%.1f MB", esc(bk.Tag), bk.SizeMB)
 			if !bk.ModTime.IsZero() {
-				fmt.Fprintf(&lines, "　%s", bk.ModTime.Local().Format("01-02 15:04"))
+				fmt.Fprintf(&lines, "　%s", bk.ModTime.In(beijing).Format("01-02 15:04"))
 			}
 		}
 		sb.WriteString("\n<b>本地备份</b>　<i>升级时自动保留，可回退</i>\n" + card(lines.String()))
@@ -251,7 +251,7 @@ func (b *Bot) showUpdateHistory(ctx context.Context, v view) {
 				mark, label = "✗", "回退失败"
 			}
 			fmt.Fprintf(&lines, "%s %s → <b>%s</b>　%s　<i>%s</i>", mark, esc(r.From), esc(r.To), label,
-				time.Unix(r.At, 0).Local().Format("01-02 15:04"))
+				time.Unix(r.At, 0).In(beijing).Format("01-02 15:04"))
 		}
 		sb.WriteString(card(lines.String()))
 	}

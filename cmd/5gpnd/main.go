@@ -609,6 +609,32 @@ func cmdRun(args []string) error {
 	}
 	hookCancel()
 
+	// 证书只加载一次，DoT 与 HTTPS 共用；续期后按文件变化热加载，不用重启。
+	keyPair, err := certrenew.LoadKeyPair(a.cfg.Gateway.CertFile, a.cfg.Gateway.KeyFile)
+	if err != nil {
+		return fmt.Errorf("加载证书失败: %w", err)
+	}
+	// 网关自己在 :80 应答续期挑战时，把 certbot 从 standalone 改为 webroot，
+	// 续期不再停服。延后十分钟：升级事务若在健康检查阶段回退到旧版，旧版
+	// 不会应答挑战，不能留下已改写的续期配置。
+	acmeOnHTTP := a.cfg.DNS.Enabled && portOf(a.cfg.DNS.HTTPListen) == 80
+	if acmeOnHTTP {
+		go func() {
+			select {
+			case <-refreshCtx.Done():
+				return
+			case <-time.After(10 * time.Minute):
+			}
+			wctx, wcancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer wcancel()
+			if changed, werr := certrenew.EnsureWebroot(wctx, a.cfg.Gateway.CertFile); werr != nil {
+				log.Printf("警告: 切换证书续期方式失败（仍按停服方式续期）: %v", werr)
+			} else if changed {
+				log.Printf("证书续期已改为由网关应答挑战，续期期间不再停服")
+			}
+		}()
+	}
+
 	// 内网 Web 面板：挂在根路径，仅内网卡来源可达，无需登录
 	var panelHandler http.Handler
 	if a.cfg.Panel.Enabled {
@@ -645,15 +671,18 @@ func cmdRun(args []string) error {
 		hints := hint.New()
 
 		sn := &sniff.Server{
-			Policy:     rt.Policy,
-			Egress:     rt.Egress,
-			Recorder:   rec,
-			OnConn:     traffic.Conn,
-			OnTraffic:  traffic.Traffic,
-			HintLookup: hints.Lookup,
-			ClientCIDR: clientPfx,
+			Policy:          rt.Policy,
+			Egress:          rt.Egress,
+			Recorder:        rec,
+			OnConn:          traffic.Conn,
+			OnTraffic:       traffic.Traffic,
+			HintLookup:      hints.Lookup,
+			ClientCIDR:      clientPfx,
 			OnDial:          health.RecordForward,
 			OnEgressTraffic: health.AddEgressTraffic,
+		}
+		if acmeOnHTTP {
+			sn.ACMEDir = certrenew.ACMEWebroot
 		}
 		sniffSrv = sn
 		health.SniffActive = sn.ActiveConns
@@ -669,14 +698,15 @@ func cmdRun(args []string) error {
 		}()
 
 		ds := &dot.Server{
-			Listen:     a.cfg.DNS.DoTListen,
-			GatewayIP:  gwIP,
-			OnRewrite:  hints.Add,
-			ClientCIDR: clientPfx,
-			Upstream:   a.cfg.DNS.Upstream,
-			CertFile:   a.cfg.Gateway.CertFile,
-			KeyFile:    a.cfg.Gateway.KeyFile,
-			Policy:     rt.Policy,
+			Listen:         a.cfg.DNS.DoTListen,
+			GatewayIP:      gwIP,
+			OnRewrite:      hints.Add,
+			ClientCIDR:     clientPfx,
+			Upstream:       a.cfg.DNS.Upstream,
+			CertFile:       a.cfg.Gateway.CertFile,
+			KeyFile:        a.cfg.Gateway.KeyFile,
+			GetCertificate: keyPair.GetCertificate,
+			Policy:         rt.Policy,
 			OnDecision: func(_ string, action string) {
 				dnsStats.record(action)
 			},
@@ -700,13 +730,13 @@ func cmdRun(args []string) error {
 		// Initial 包的 SNI 并按策略转发 UDP，让 HTTP/3 直接走通。
 		if a.cfg.DNS.QUICTakeoverEnabled() {
 			qs := &quicfwd.Server{
-				Policy:     rt.Policy,
-				Egress:     rt.Egress,
-				Recorder:   rec,
-				OnConn:     traffic.Conn,
-				OnTraffic:  traffic.Traffic,
-				HintLookup: hints.Lookup,
-				ClientCIDR: clientPfx,
+				Policy:          rt.Policy,
+				Egress:          rt.Egress,
+				Recorder:        rec,
+				OnConn:          traffic.Conn,
+				OnTraffic:       traffic.Traffic,
+				HintLookup:      hints.Lookup,
+				ClientCIDR:      clientPfx,
 				OnDial:          health.RecordForward,
 				OnEgressTraffic: health.AddEgressTraffic,
 			}
@@ -884,6 +914,7 @@ func cmdRun(args []string) error {
 				Notify:    notify.Send,
 			}
 			go cw.Run(botCtx, 20*time.Second, 12*time.Hour)
+			go cw.RunRenewal(botCtx, 30*time.Minute)
 		}
 	}
 
@@ -898,19 +929,14 @@ func cmdRun(args []string) error {
 		ClientCIDR:   clientPfx,
 	}
 
-	cert, err := tls.LoadX509KeyPair(a.cfg.Gateway.CertFile, a.cfg.Gateway.KeyFile)
-	if err != nil {
-		return fmt.Errorf("加载证书失败: %w", err)
-	}
-
 	hs := &http.Server{
 		Addr:              a.cfg.Gateway.Listen,
 		Handler:           root,
 		ReadHeaderTimeout: 10 * time.Second,
 		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-			NextProtos:   []string{"h2", "http/1.1"},
+			GetCertificate: keyPair.GetCertificate,
+			MinVersion:     tls.VersionTLS12,
+			NextProtos:     []string{"h2", "http/1.1"},
 		},
 		IdleTimeout: 5 * time.Minute,
 	}

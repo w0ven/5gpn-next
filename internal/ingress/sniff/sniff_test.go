@@ -4,8 +4,11 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -216,5 +219,38 @@ func TestPeekHTTPHostDoesNotConsume(t *testing.T) {
 	}
 	if string(rest) != raw {
 		t.Fatalf("窥探消费了数据：\n得到 %q\n期望 %q", string(rest), raw)
+	}
+}
+
+// TestServeACMEOnlyChallengeFiles 网段外的来源只能拿到挑战文件，其余 404，
+// 不能借此走网关转发。
+func TestServeACMEOnlyChallengeFiles(t *testing.T) {
+	dir := t.TempDir()
+	cd := filepath.Join(dir, ".well-known", "acme-challenge")
+	if err := os.MkdirAll(cd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cd, "tok_EN-1"), []byte("tok_EN-1.thumb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "secret"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{ACMEDir: dir}
+	get := func(path string) string {
+		cli, srv := net.Pipe()
+		go s.serveACME(srv)
+		_, _ = cli.Write([]byte("GET " + path + " HTTP/1.1\r\nHost: gw.example\r\n\r\n"))
+		b, _ := io.ReadAll(cli)
+		cli.Close()
+		return string(b)
+	}
+	if r := get("/.well-known/acme-challenge/tok_EN-1"); !strings.HasPrefix(r, "HTTP/1.1 200") || !strings.HasSuffix(r, "tok_EN-1.thumb") {
+		t.Fatalf("挑战文件应 200: %q", r)
+	}
+	for _, p := range []string{"/.well-known/acme-challenge/../../secret", "/.well-known/acme-challenge/missing", "/", "http://127.0.0.1:9095/"} {
+		if r := get(p); !strings.HasPrefix(r, "HTTP/1.1 404") {
+			t.Fatalf("%s 应 404: %q", p, r)
+		}
 	}
 }

@@ -27,12 +27,14 @@ const (
 
 // 以下三段必须与 install.sh 写出的钩子逐字节一致，由测试校验。
 
-// PreHook 续期前停服让出 :80，并临时放行公网 ACME。
+// PreHook 续期前临时放行公网 ACME；仅在仍有 standalone 续期时停服让出 :80。
 const PreHook = `#!/bin/bash
-# 续期前停服让出 :80，并把 ACME 临时放行插到公网兜底 drop 之前。
-# 仅在服务确实运行时记录状态，避免续期后误启动本就停止的服务。
+# 续期前把 ACME 临时放行插到公网兜底 drop 之前。网关自己在 :80 应答
+# webroot 挑战，不用停服；只有续期配置仍是 standalone（certbot 要自己
+# 占用 :80）时才停服让出端口，并记录状态以便续期后恢复。
 set -u
 STATE=/run/5gpn-next-cert-renew.state
+date +%s > /var/lib/5gpn-next/cert-renew-attempt 2>/dev/null || true
 rm_rules() {
   local handle
   while read -r handle; do
@@ -42,7 +44,8 @@ rm_rules() {
     | awk '/comment "5gpn-acme-tmp"/ { for (i=1; i<=NF; i++) if ($i=="handle") print $(i+1) }')
 }
 rm_rules
-if systemctl is-active --quiet 5gpn-next.service; then
+if grep -qsE '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*standalone' /etc/letsencrypt/renewal/*.conf \
+  && systemctl is-active --quiet 5gpn-next.service; then
   echo stopped-by-certbot > "$STATE"
   systemctl stop 5gpn-next.service
 else
@@ -58,11 +61,12 @@ fi
 exit 0
 `
 
-// PostHook 收回 ACME 临时放行并恢复网关服务。
+// PostHook 收回 ACME 临时放行，恢复被停的网关，并记录本次续期已结束。
 const PostHook = `#!/bin/bash
 # 无论续期成功与否都先收回 ACME 临时公网放行，再恢复网关服务。
 set -u
 STATE=/run/5gpn-next-cert-renew.state
+date +%s > /var/lib/5gpn-next/cert-renew-finished 2>/dev/null || true
 while read -r handle; do
   [ -n "$handle" ] || continue
   nft delete rule inet fgpn input handle "$handle" 2>/dev/null || true
@@ -79,9 +83,9 @@ fi
 exit 0
 `
 
-// DeployHook 新证书落地后重启服务以加载。
+// DeployHook 无需动作：网关检测到证书文件变化后自行加载新证书。
 const DeployHook = `#!/bin/bash
-systemctl is-active --quiet 5gpn-next.service && systemctl restart 5gpn-next.service
+# 网关会检测证书文件变化并自动加载新证书，无需重启。
 exit 0
 `
 

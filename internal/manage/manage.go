@@ -1125,12 +1125,24 @@ func (m *Manager) RollbackVersions() []string {
 }
 
 // Rollback 回退到指定版本。
+//
+// 先还原 certbot 的 standalone 续期配置：旧版本不会在 :80 应答 webroot
+// 挑战，留着改写后的配置会让证书再也续不上。回退到同样支持的版本时，
+// 它启动后会再改回来。
 func (m *Manager) Rollback(ctx context.Context, tag string) (string, error) {
 	if m.Updater == nil {
 		return "", fmt.Errorf("更新功能未启用")
 	}
+	m.mu.RLock()
+	certFile := m.Cfg.Gateway.CertFile
+	m.mu.RUnlock()
+	if _, err := restoreStandalone(ctx, certFile); err != nil {
+		return "", fmt.Errorf("还原证书续期配置失败，已取消回退: %w", err)
+	}
 	return m.Updater.Rollback(ctx, tag)
 }
+
+var restoreStandalone = certrenew.RestoreStandalone
 
 // ReloadRuntime 仅重建运行态（策略引擎/出口），不改配置文件。
 // 供规则集后台刷新等场景使用。

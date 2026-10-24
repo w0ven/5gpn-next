@@ -17,7 +17,10 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,6 +75,11 @@ type Server struct {
 	// 避免宿主 INPUT 默认放行时退化成公网开放代理。
 	ClientCIDR netip.Prefix
 
+	// ACMEDir 非空时，HTTP 入口替 certbot 应答来自客户端网段之外的
+	// /.well-known/acme-challenge/ 请求（webroot 续期），续期不用停网关。
+	// 公网 :80 平时被防火墙挡住，只在续期钩子临时放行期间可达。
+	ACMEDir string
+
 	// OnDial 在每次出口拨号完成后回调（可为空），供健康监控埋点。耗时为微秒。
 	OnDial func(egress string, ok bool, ms int64)
 
@@ -84,6 +92,7 @@ type Server struct {
 	Hinted  atomic.Int64
 	Refused atomic.Int64 // 因超过并发上限而被拒的连接数
 	Denied  atomic.Int64 // 因来源不在客户端网段而拒绝的连接数
+	ACME    atomic.Int64 // 应答过的 ACME 挑战请求数
 
 	seq atomic.Uint64
 
@@ -163,6 +172,13 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string, isTLS bool) er
 			continue
 		}
 		if !s.allowedClient(c.RemoteAddr()) {
+			if !isTLS && s.ACMEDir != "" && s.acquire() {
+				go func() {
+					defer s.release()
+					s.serveACME(c)
+				}()
+				continue
+			}
 			s.Denied.Add(1)
 			_ = c.Close()
 			continue
@@ -584,4 +600,39 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// serveACME 只应答 ACME http-01 挑战文件，其余一律 404，绝不转发。
+func (s *Server) serveACME(c net.Conn) {
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	req, err := http.ReadRequest(bufio.NewReaderSize(c, 4096))
+	if err != nil {
+		return
+	}
+	code, body := http.StatusNotFound, "not found"
+	if tok, ok := strings.CutPrefix(req.URL.Path, "/.well-known/acme-challenge/"); ok && validACMEToken(tok) {
+		b, err := os.ReadFile(filepath.Join(s.ACMEDir, ".well-known", "acme-challenge", tok))
+		if err == nil && len(b) <= 4096 {
+			code, body = http.StatusOK, string(b)
+			s.ACME.Add(1)
+		}
+	}
+	fmt.Fprintf(c, "HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		code, http.StatusText(code), len(body), body)
+}
+
+// validACMEToken 只接受 base64url 字符，挡住 ../ 之类的路径穿越。
+func validACMEToken(tok string) bool {
+	if tok == "" || len(tok) > 256 {
+		return false
+	}
+	for _, r := range tok {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }

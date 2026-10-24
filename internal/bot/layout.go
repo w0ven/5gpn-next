@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html"
 	"strings"
+	"time"
 )
 
 // head 是每一屏的标题行：图标 + 粗体标题，可带一个灰色副标题。
@@ -30,6 +31,10 @@ func note(iconName, text string) string {
 }
 
 func esc(s string) string { return html.EscapeString(s) }
+
+// beijing 是界面上所有绝对时间的时区。服务器通常跑在 UTC，用本地时区
+// 格式化会比用户看到的时间慢 8 小时。
+var beijing = time.FixedZone("Asia/Shanghai", 8*60*60)
 
 // btn 是一个 inline 按钮。Data 以 "url:" 开头时为链接按钮。
 // Icon 为功能图标名或 "app:<key>"；Style 为 primary / success / danger。
