@@ -68,7 +68,12 @@ type Manager struct {
 	// Health 是内置健康监控（可为空）
 	Health *monitor.Monitor
 
+	// FetchRuleSet 在缓存缺失时下载规则集（可为空）。
+	FetchRuleSet func(ctx context.Context, name, url string) error
+
 	started time.Time
+	// appChanged 记录应用出口最近一次变更时间，核对只看此后的转发。
+	appChanged map[string]time.Time
 }
 
 // ProfileDownloadURL 返回当前蜂窝 DNS 描述文件的 HTTPS 下载地址。
@@ -530,6 +535,12 @@ func (m *Manager) RemoveEgress(name string) error {
 		kept = append(kept, r)
 	}
 	m.Cfg.Rules = kept
+	// 引用该出口的应用分流改回跟随默认
+	for k, eg := range m.Cfg.Apps {
+		if eg == name {
+			delete(m.Cfg.Apps, k)
+		}
+	}
 
 	if err := m.saveAndReloadLocked(); err != nil {
 		return err

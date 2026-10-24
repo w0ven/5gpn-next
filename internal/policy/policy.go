@@ -155,6 +155,14 @@ func (e *Engine) DomainSetLen(name string) int {
 	return ds.Len()
 }
 
+// DomainSetMatch 报告 host 是否命中指定域名规则集；规则集未注册时为 false。
+func (e *Engine) DomainSetMatch(name, host string) bool {
+	e.mu.RLock()
+	ds := e.domainSets[name]
+	e.mu.RUnlock()
+	return ds != nil && ds.Match(host)
+}
+
 // DomesticRulesReady 报告国内直连的两套强制规则是否都已有效载入。
 // 仅“注册了名字”不够，空规则集同样视为未就绪。
 func (e *Engine) DomesticRulesReady() bool {

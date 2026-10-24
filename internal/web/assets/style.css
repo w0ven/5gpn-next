@@ -523,6 +523,67 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   color: var(--accent-hover);
 }
 
+/* ---------- 应用分流 ---------- */
+
+.app-grid {
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(232px, 1fr));
+  gap: 10px;
+}
+.app-tile {
+  display: grid;
+  grid-template-columns: 40px 1fr;
+  gap: 10px 12px;
+  align-items: center;
+  padding: 13px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 13px;
+}
+.app-on { background: var(--accent-soft); border-color: var(--accent-line); }
+.app-logo { width: 40px; height: 40px; border-radius: 10px; object-fit: contain; }
+.app-name { font-weight: 680; font-size: 14px; }
+.app-sub { color: var(--ink-3); font-size: 11.5px; margin-top: 2px; }
+.app-warn { color: var(--warn); }
+.app-ctl { grid-column: 1 / -1; display: flex; gap: 8px; }
+.app-select {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+}
+.app-select:focus { outline: 3px solid rgba(13, 150, 99, .14); border-color: var(--accent); }
+.app-check {
+  margin-top: 16px;
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: var(--surface-2);
+}
+.app-check h3 { margin: 0 0 4px; font-size: 14px; font-weight: 700; }
+.app-check .verdict { margin: 0 0 10px; font-size: 13px; color: var(--ok); }
+.app-check .check-row + .verdict { margin-top: 16px; }
+.app-check .verdict.bad { color: var(--err); }
+.check-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+.check-row:last-child { border-bottom: 0; }
+.check-host { font-family: var(--mono); overflow-wrap: anywhere; }
+.check-host.bad { color: var(--err); }
+.check-rule { display: block; color: var(--ink-3); font-size: 11.5px; }
+.check-eg { flex: 0 0 auto; color: var(--ink-3); text-align: right; }
+
 /* ---------- 页脚 / toast ---------- */
 
 footer {
@@ -567,4 +628,13 @@ footer {
   .stat-grid,
   .ad-metrics { grid-template-columns: 1fr; }
   .form-inline { flex-direction: column; }
+  .app-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .app-tile { grid-template-columns: 32px 1fr; gap: 8px 10px; padding: 11px; align-content: start; }
+  .app-logo { width: 32px; height: 32px; border-radius: 8px; }
+  .app-name { font-size: 13.5px; }
+  .app-sub { font-size: 11px; }
+  .app-ctl { flex-wrap: wrap; }
+  .app-ctl .btn-sm { flex: 1 1 100%; }
+  .check-row { flex-direction: column; gap: 2px; }
+  .check-eg { text-align: left; }
 }

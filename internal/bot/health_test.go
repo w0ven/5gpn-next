@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/w0ven/5gpn-next/internal/manage"
 	"github.com/w0ven/5gpn-next/internal/monitor"
 )
 
@@ -130,5 +131,39 @@ func TestCertHealthLine(t *testing.T) {
 			t.Errorf("certHealthLine(%d) = %q, want %q", c.days, got, c.want)
 		}
 		assertTelegramHTML(t, got)
+	}
+}
+
+func TestAppButtonsCarryLogoIcon(t *testing.T) {
+	kb := inlineKeyboard([]btn{{"YouTube", "app:youtube"}, {"规则", "rules"}, {"未知", "app:nope"}})
+	if !strings.Contains(kb, `"callback_data":"app:youtube","icon_custom_emoji_id":"5818947960364342679"`) {
+		t.Errorf("YouTube 按钮缺少 Logo 图标: %s", kb)
+	}
+	if strings.Count(kb, "icon_custom_emoji_id") != 1 {
+		t.Errorf("只有已知应用按钮应带图标: %s", kb)
+	}
+}
+
+func TestAppCheckCardIsValidTelegramHTML(t *testing.T) {
+	out := checkCard([]manage.AppDomain{
+		{Host: "i.ytimg.com", Egresses: map[string]int{"nuross": 2}, Count: 2, Rule: "FINAL → 代理:<nuross>"},
+		{Host: "*.googlevideo.com", Egresses: map[string]int{"ctc": 9}, Count: 9, OK: true},
+	}, map[string]string{"ctc": "🇭🇰CTC"})
+	assertTelegramHTML(t, out)
+	if !strings.Contains(out, "🇭🇰CTC×9") || !strings.Contains(out, "✗ <code>i.ytimg.com</code>") {
+		t.Errorf("核对卡片内容不符合预期: %s", out)
+	}
+}
+
+func TestStripButtonIconsKeepsButtons(t *testing.T) {
+	kb := inlineKeyboard([]btn{{"YouTube", "app:youtube"}, {"Google", "app:google"}}, []btn{btnHome()})
+	out := stripButtonIcons(kb)
+	if strings.Contains(out, buttonIconField) {
+		t.Fatalf("图标未去除: %s", out)
+	}
+	for _, want := range []string{`"callback_data":"app:youtube"`, `"callback_data":"app:google"`, `"text":"« 主菜单"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("去图标后丢了按钮 %s: %s", want, out)
+		}
 	}
 }

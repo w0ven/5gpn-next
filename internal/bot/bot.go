@@ -213,6 +213,15 @@ type view struct {
 
 // render 渲染一屏：能编辑就编辑，避免消息越堆越多。
 func (b *Bot) render(ctx context.Context, v view, text, keyboard string) int64 {
+	id := b.renderOnce(ctx, v, text, keyboard)
+	if id == 0 && strings.Contains(keyboard, buttonIconField) {
+		// 按钮图标要求 Bot 主人有 Premium；被拒时去掉图标重发，不让整屏发不出去。
+		id = b.renderOnce(ctx, v, text, stripButtonIcons(keyboard))
+	}
+	return id
+}
+
+func (b *Bot) renderOnce(ctx context.Context, v view, text, keyboard string) int64 {
 	if v.msgID != 0 {
 		p := url.Values{}
 		p.Set("chat_id", strconv.FormatInt(v.chatID, 10))
@@ -415,6 +424,14 @@ func (b *Bot) dispatch(ctx context.Context, v view, cmd string) {
 		b.showHealthDetail(ctx, v, strings.TrimPrefix(cmd, "health_detail:"))
 	case cmd == "rules":
 		b.showRules(ctx, v)
+	case cmd == "apps":
+		b.showApps(ctx, v)
+	case strings.HasPrefix(cmd, "app:"):
+		b.showApp(ctx, v, strings.TrimPrefix(cmd, "app:"))
+	case strings.HasPrefix(cmd, "app_set:"):
+		b.doSetApp(ctx, v, strings.TrimPrefix(cmd, "app_set:"))
+	case strings.HasPrefix(cmd, "app_check:"):
+		b.showAppCheck(ctx, v, strings.TrimPrefix(cmd, "app_check:"))
 	case cmd == "adblock":
 		b.showAdBlock(ctx, v)
 	case cmd == "adblock_on":
@@ -1191,6 +1208,7 @@ func (b *Bot) showRules(ctx context.Context, v view) {
 	sb.WriteString("</blockquote>")
 
 	var rows [][]btn
+	rows = append(rows, []btn{{"📱 应用分流", "apps"}})
 	rows = append(rows, []btn{{"➕ 添加规则", "ask_rule_add"}})
 	if len(rules) > 0 {
 		rows = append(rows, []btn{{"🗑 删除规则", "rule_del_menu"}})
@@ -1769,6 +1787,7 @@ func inlineKeyboard(rows ...[]btn) string {
 		Text string `json:"text"`
 		Data string `json:"callback_data,omitempty"`
 		URL  string `json:"url,omitempty"`
+		Icon string `json:"icon_custom_emoji_id,omitempty"` // 字段名须与 buttonIconField 一致
 	}
 	out := make([][]ib, 0, len(rows))
 	for _, r := range rows {
@@ -1778,7 +1797,7 @@ func inlineKeyboard(rows ...[]btn) string {
 				row = append(row, ib{Text: e.Text, URL: strings.TrimPrefix(e.Data, "url:")})
 				continue
 			}
-			row = append(row, ib{Text: e.Text, Data: e.Data})
+			row = append(row, ib{Text: e.Text, Data: e.Data, Icon: buttonIcon(e.Data)})
 		}
 		out = append(out, row)
 	}

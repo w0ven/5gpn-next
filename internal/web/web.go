@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/w0ven/5gpn-next/internal/apps"
 	"github.com/w0ven/5gpn-next/internal/monitor"
 
 	"github.com/w0ven/5gpn-next/internal/config"
@@ -86,6 +87,7 @@ func (p *Panel) Handler() http.Handler {
 	mux.HandleFunc("/", p.guard(p.handleIndex))
 	mux.HandleFunc("/style.css", p.serveAsset("assets/style.css", "text/css; charset=utf-8"))
 	mux.HandleFunc("/app.js", p.serveAsset("assets/app.js", "application/javascript; charset=utf-8"))
+	mux.HandleFunc("/apps/", p.serveAppLogo)
 
 	// 兼容旧地址：/panel 一律跳回根
 	mux.HandleFunc("/panel", p.redirectRoot)
@@ -98,6 +100,8 @@ func (p *Panel) Handler() http.Handler {
 	mux.HandleFunc("/api/egress", p.apiGuard(p.apiEgress))
 	mux.HandleFunc("/api/probe", p.apiGuard(p.apiProbe))
 	mux.HandleFunc("/api/health", p.apiGuard(p.apiHealth))
+	mux.HandleFunc("/api/apps", p.apiGuard(p.apiApps))
+	mux.HandleFunc("/api/apps/check", p.apiGuard(p.apiAppCheck))
 
 	return mux
 }
@@ -212,7 +216,68 @@ func (p *Panel) serveAsset(name, ctype string) http.HandlerFunc {
 	}
 }
 
+// serveAppLogo 提供应用 Logo（取自 ZaiHuaNews 表情包的缩略图）。
+func (p *Panel) serveAppLogo(w http.ResponseWriter, r *http.Request) {
+	if !p.sourceAllowed(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	key := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/apps/"), ".webp")
+	if _, ok := apps.Get(key); !ok {
+		http.NotFound(w, r)
+		return
+	}
+	b, err := assets.ReadFile("assets/apps/" + key + ".webp")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/webp")
+	w.Header().Set("Cache-Control", "max-age=86400")
+	w.Write(b)
+}
+
 // ---------- API ----------
+
+func (p *Panel) appsPayload() map[string]any {
+	choices := []map[string]string{}
+	for _, c := range p.Manager.AppEgressChoices() {
+		choices = append(choices, map[string]string{"name": c[0], "display": c[1]})
+	}
+	return map[string]any{"apps": p.Manager.Apps(), "egress": choices}
+}
+
+func (p *Panel) apiApps(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, p.appsPayload())
+	case http.MethodPost:
+		var body struct {
+			Key    string `json:"key"`
+			Egress string `json:"egress"` // 空表示跟随默认
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
+			return
+		}
+		if err := p.Manager.SetAppEgress(body.Key, body.Egress); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, p.appsPayload())
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "方法不支持"})
+	}
+}
+
+func (p *Panel) apiAppCheck(w http.ResponseWriter, r *http.Request) {
+	res, err := p.Manager.CheckApp(r.URL.Query().Get("key"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
 
 func (p *Panel) apiStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, p.Manager.Status(p.Version))

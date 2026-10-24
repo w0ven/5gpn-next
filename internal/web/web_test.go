@@ -272,3 +272,59 @@ func TestProbeRejectsWhenOverConcurrent(t *testing.T) {
 		t.Fatalf("over-limit request still probed: calls=%d", calls.Load())
 	}
 }
+
+func TestAppsAPIAndLogos(t *testing.T) {
+	panel, _ := testPanel(t)
+	h := panel.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/apps", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/apps = %d %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Apps []struct {
+			Key    string `json:"key"`
+			Egress string `json:"egress"`
+		} `json:"apps"`
+		Egress []struct {
+			Name string `json:"name"`
+		} `json:"egress"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Apps) == 0 || len(body.Egress) == 0 || body.Egress[0].Name != "DIRECT" {
+		t.Fatalf("应用或出口列表为空: %+v", body)
+	}
+
+	// 每个应用都必须有嵌入的 Logo
+	for _, a := range body.Apps {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/apps/"+a.Key+".webp", nil))
+		if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "image/webp" || rec.Body.Len() < 100 {
+			t.Errorf("%s 的 Logo 缺失: %d %s", a.Key, rec.Code, rec.Header().Get("Content-Type"))
+		}
+	}
+	for _, p := range []string{"/apps/nope.webp", "/apps/../app.js"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
+		if rec.Code == http.StatusOK && rec.Header().Get("Content-Type") == "image/webp" {
+			t.Errorf("%s 不应返回 Logo", p)
+		}
+	}
+
+	post := func(payload string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/apps", strings.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := post(`{"key":"youtube","egress":"missing"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("不存在的出口应 400，实际 %d", rec.Code)
+	}
+	if rec := post(`{"key":"youtube","egress":"DIRECT"}`); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"egress":"DIRECT"`) {
+		t.Errorf("设置本机直出失败: %d %s", rec.Code, rec.Body.String())
+	}
+}

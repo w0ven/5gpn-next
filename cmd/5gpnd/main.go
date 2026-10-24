@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/w0ven/5gpn-next/internal/apps"
 	"github.com/w0ven/5gpn-next/internal/bot"
 	"github.com/w0ven/5gpn-next/internal/certrenew"
 	"github.com/w0ven/5gpn-next/internal/config"
@@ -155,6 +156,11 @@ func loadRuleSets(cfg *config.Config, eng *policy.Engine) error {
 			// 期间规则不完整，手机访问会出现错误分流。
 			if p, ok := f.Cached(rs.Name); ok {
 				src = p
+			} else if apps.IsListRuleSet(rs.Name) {
+				// 应用清单可缺失（内置核心域名兜底），热重载在管理锁内执行，
+				// 不能在这里等网络；下载由启用时的预取与后台刷新负责。
+				log.Printf("应用清单 %s 尚未下载，先用内置核心域名", rs.Name)
+				continue
 			} else {
 				p, err := f.Fetch(ctx, rs.Name, rs.URL)
 				if err != nil {
@@ -200,6 +206,7 @@ func applyRules(cfg *config.Config, eng *policy.Engine) error {
 	//   内置前置（私网保护）
 	//   → 用户规则（最高优先，可覆盖广告拦截）
 	//   → 广告拦截（白名单 direct 在前、RULE-SET block 在后）
+	//   → 应用分流（具体应用在前、Google 这类大清单在后）
 	//   → Google 下载链路修复（必须在国内直连之前）
 	//   → 内置兜底（国内直连）
 	//
@@ -208,6 +215,8 @@ func applyRules(cfg *config.Config, eng *policy.Engine) error {
 	// Google 修复同理：dl.google.com / gvt1.com 等下载域名经国内 DNS
 	// 可能解析到 Google 中国节点 IP（GEOIP=CN），若落到 GEOIP 兜底
 	// 会让手机直连被墙节点，表现为 Play 能浏览、下载永远转圈。
+	// 应用清单排在广告拦截之后：Google/YouTube 清单自带广告子域，
+	// 不能因为选了出口就让广告不再被拦。
 	// 内置规则不在配置文件里，Bot/面板改不到也删不掉。
 	finalAct, finalEg := parseAction(cfg.Final)
 	googleFix := config.BuiltinGoogleFix()
@@ -224,6 +233,7 @@ func applyRules(cfg *config.Config, eng *policy.Engine) error {
 	all = append(all, config.BuiltinDoHBlock()...)
 	all = append(all, cfg.Rules...)
 	all = append(all, cfg.BuiltinAdBlock()...)
+	all = append(all, cfg.AppRules()...)
 	all = append(all, googleFix...)
 	all = append(all, config.BuiltinPost()...)
 	for i, line := range all {
@@ -436,6 +446,15 @@ func cmdRun(args []string) error {
 			g.Note = "国内网站直连，国外网站经网关分流；无需安装任何应用。"
 		}
 		return g
+	}
+
+	mgr.FetchRuleSet = func(ctx context.Context, name, url string) error {
+		f := ruleset.NewFetcher("/var/lib/5gpn-next/rulesets")
+		if _, ok := f.Cached(name); ok {
+			return nil
+		}
+		_, err := f.Fetch(ctx, name, url)
+		return err
 	}
 
 	// 配置变更后重建策略与出口，无需重启进程
