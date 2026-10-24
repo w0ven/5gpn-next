@@ -14,6 +14,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/w0ven/5gpn-next/internal/apps"
 )
 
 // Config 是完整配置。
@@ -35,6 +37,10 @@ type Config struct {
 
 	// AdBlock 是广告/追踪拦截配置。
 	AdBlock AdBlockConfig `json:"ad_block"`
+
+	// Apps 是应用分流：应用 Key → 出口名（DIRECT 表示本机直出）。
+	// 未出现的应用跟随默认规则。
+	Apps map[string]string `json:"apps,omitempty"`
 
 	// PreferIPv4 让所有出口对 IPv6 字面量目标立即快速失败（0ms），
 	// 促使客户端 Happy Eyeballs 直接改用 IPv4。
@@ -233,20 +239,51 @@ func (c *Config) BuiltinAdBlock() []string {
 // 控制，关闭时应彻底不下载不占内存。
 func (c *Config) EffectiveRuleSets() []RuleSetConfig {
 	out := append([]RuleSetConfig(nil), c.RuleSets...)
-	if !c.AdBlock.Enabled {
-		return out
+	has := func(name string) bool {
+		for _, rs := range out {
+			if rs.Name == name {
+				return true
+			}
+		}
+		return false
 	}
-	for _, rs := range out {
-		if rs.Name == AdBlockRuleSetName {
-			return out // 用户已显式配置，以其为准
+	// 用户已显式配置同名规则集时以其为准。
+	if c.AdBlock.Enabled && !has(AdBlockRuleSetName) {
+		out = append(out, RuleSetConfig{
+			Name:          AdBlockRuleSetName,
+			Kind:          "domain",
+			URL:           c.AdBlockURLOrDefault(),
+			IntervalHours: 24,
+		})
+	}
+	// 应用清单只在启用时下载，与广告规则同理不写进 rulesets 数组。
+	for _, a := range apps.All() {
+		if c.Apps[a.Key] == "" {
+			continue
+		}
+		for _, l := range a.Lists {
+			if name := apps.RuleSetName(l); !has(name) {
+				out = append(out, RuleSetConfig{
+					Name:          name,
+					Kind:          "domain",
+					URL:           apps.ListURL(l),
+					IntervalHours: 24,
+				})
+			}
 		}
 	}
-	return append(out, RuleSetConfig{
-		Name:          AdBlockRuleSetName,
-		Kind:          "domain",
-		URL:           c.AdBlockURLOrDefault(),
-		IntervalHours: 24,
-	})
+	return out
+}
+
+// AppRules 按匹配优先级生成已启用应用的分流规则。
+func (c *Config) AppRules() []string {
+	var out []string
+	for _, a := range apps.MatchOrder() {
+		if eg := c.Apps[a.Key]; eg != "" {
+			out = append(out, a.Rules(eg)...)
+		}
+	}
+	return out
 }
 
 // RuleSetConfig 是一个规则集来源。

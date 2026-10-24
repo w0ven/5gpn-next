@@ -6,7 +6,8 @@ import "fmt"
 //
 // 渲染用 <tg-emoji emoji-id="...">fallback</tg-emoji>：Premium 客户端
 // 显示动态贴纸，其余客户端与通知栏自动回落为普通 emoji，永不坏排版。
-// 注意：inline keyboard 按钮文字不支持 custom emoji，只能用在正文。
+// 注意：inline keyboard 按钮文字不支持 custom emoji；按钮图标只能走
+// icon_custom_emoji_id 字段（见 buttonIcon）。
 var emojiIDs = map[string]string{
 	"🔥": "5845753207740964673",
 	"👍": "5861617253564292990",

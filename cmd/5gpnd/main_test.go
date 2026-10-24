@@ -143,3 +143,67 @@ func TestProxyFinalFallsBackDirectWhenDomesticRulesMissing(t *testing.T) {
 		t.Fatalf("missing domestic rules must fail closed to DIRECT, got %s %q", d.Action, d.Egress)
 	}
 }
+
+// 应用分流：具体应用先于 Google，用户规则与广告拦截先于应用，
+// 清单未下载时内置核心域名仍把关键流量送到选定出口。
+func TestAppRoutingOrder(t *testing.T) {
+	cfg := config.Default()
+	cfg.AdBlock.Enabled = true
+	cfg.Rules = []string{"DOMAIN,music.youtube.com,proxy:special"}
+	cfg.Final = "proxy:nuross"
+	cfg.Apps = map[string]string{"youtube": "ctc", "google": "DIRECT"}
+
+	e := readyEngine()
+	yt := ruleset.NewDomainSet()
+	yt.AddRule("+.youtube.com")
+	yt.AddRule("+.googlevideo.com")
+	e.RegisterDomainSet("app-youtube", yt)
+	g := ruleset.NewDomainSet()
+	g.AddRule("+.google.com")
+	g.AddRule("+.youtube.com")
+	g.AddRule("+.googleapis.com")
+	e.RegisterDomainSet("app-google", g)
+	ad := ruleset.NewDomainSet()
+	ad.AddRule("ads.youtube.com")
+	e.RegisterDomainSet(config.AdBlockRuleSetName, ad)
+	if err := applyRules(cfg, e); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		target string
+		action policy.Action
+		egress string
+	}{
+		{"www.youtube.com:443", policy.ActionProxy, "ctc"},
+		{"rr2---sn-abc.googlevideo.com:443", policy.ActionProxy, "ctc"},
+		{"youtubei.googleapis.com:443", policy.ActionProxy, "ctc"},
+		{"www.google.com:443", policy.ActionProxy, "DIRECT"},
+		{"play.googleapis.com:443", policy.ActionProxy, "DIRECT"},
+		{"music.youtube.com:443", policy.ActionProxy, "special"},
+		{"ads.youtube.com:443", policy.ActionBlock, ""},
+		{"www.baidu.com:443", policy.ActionDirect, ""},
+		{"chatgpt.com:443", policy.ActionProxy, "nuross"},
+	}
+	for _, tc := range cases {
+		d := e.Match(target(t, tc.target))
+		if d.Action != tc.action || d.Egress != tc.egress {
+			t.Errorf("%s => action=%s egress=%q rule=%s; want %s %q",
+				tc.target, d.Action, d.Egress, d.Rule, tc.action, tc.egress)
+		}
+	}
+}
+
+func TestAppRoutingCoreWorksWithoutList(t *testing.T) {
+	cfg := config.Default()
+	cfg.Final = "proxy:nuross"
+	cfg.Apps = map[string]string{"youtube": "ctc"}
+	e := readyEngine() // 未注册 app-youtube：模拟清单首次下载失败
+	if err := applyRules(cfg, e); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{"www.youtube.com:443", "rr1---sn-x.googlevideo.com:443", "i.ytimg.com:443", "youtubei.googleapis.com:443"} {
+		if d := e.Match(target(t, h)); d.Egress != "ctc" {
+			t.Errorf("%s => egress=%q rule=%s，清单缺失时核心域名仍应走 ctc", h, d.Egress, d.Rule)
+		}
+	}
+}

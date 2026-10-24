@@ -323,6 +323,129 @@ async function loadRules() {
   }
 }
 
+// ---------- 应用分流 ----------
+
+let egressNames = {};
+
+function appSub(a) {
+  if (!a.egress) return el('div', 'app-sub', '跟随默认规则');
+  if (!a.list_domains) {
+    return el('div', 'app-sub app-warn', '清单尚未下载，先用内置 ' + a.core + ' 个核心域名');
+  }
+  return el('div', 'app-sub', '清单 ' + number(a.list_domains) + ' 条 + 内置 ' + a.core + ' 条');
+}
+
+function renderApps(data) {
+  egressNames = {};
+  for (const c of data.egress || []) egressNames[c.name] = c.display;
+  const box = $('apps-grid');
+  box.textContent = '';
+  for (const a of data.apps || []) {
+    const tile = el('div', 'app-tile' + (a.egress ? ' app-on' : ''));
+    const logo = el('img', 'app-logo');
+    logo.src = '/apps/' + a.key + '.webp';
+    logo.alt = '';
+    tile.appendChild(logo);
+    const meta = el('div');
+    meta.appendChild(el('div', 'app-name', a.name));
+    meta.appendChild(appSub(a));
+    tile.appendChild(meta);
+
+    const ctl = el('div', 'app-ctl');
+    const sel = el('select', 'app-select');
+    sel.setAttribute('aria-label', a.name + ' 的出口');
+    const opts = [['', '跟随默认']].concat((data.egress || []).map((c) => [c.name, c.display]));
+    for (const [value, label] of opts) {
+      const o = el('option', null, label);
+      o.value = value;
+      if (value === (a.egress || '')) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.onchange = () => setApp(a, sel);
+    ctl.appendChild(sel);
+    if (a.egress) {
+      const chk = el('button', 'btn btn-sm', '核对');
+      chk.onclick = () => checkApp(a);
+      ctl.appendChild(chk);
+    }
+    tile.appendChild(ctl);
+    box.appendChild(tile);
+  }
+}
+
+async function setApp(a, sel) {
+  const egress = sel.value;
+  sel.disabled = true;
+  try {
+    renderApps(await api('/api/apps', { method: 'POST', body: JSON.stringify({ key: a.key, egress }) }));
+    toast(a.name + ' → ' + (egress ? (egressNames[egress] || egress) : '跟随默认'));
+    if (!$('app-check').hidden) $('app-check').hidden = true;
+  } catch (err) {
+    toast(err.message, true);
+    await loadApps();
+  }
+}
+
+function windowText(since) {
+  const minutes = Math.max(1, Math.round((Date.now() - Date.parse(since)) / 60000));
+  return minutes < 60 ? '最近 ' + minutes + ' 分钟' : '最近 ' + Math.round(minutes / 60) + ' 小时';
+}
+
+function egressText(map) {
+  return Object.entries(map)
+    .sort((x, y) => y[1] - x[1])
+    .map(([name, n]) => (egressNames[name] || name) + ' ×' + n)
+    .join('、');
+}
+
+function checkRows(box, list) {
+  for (const d of list) {
+    const row = el('div', 'check-row');
+    const host = el('span', 'check-host' + (d.ok ? '' : ' bad'), (d.ok ? '✓ ' : '✗ ') + d.host);
+    if (!d.ok && d.rule) host.appendChild(el('span', 'check-rule', d.rule));
+    row.appendChild(host);
+    row.appendChild(el('span', 'check-eg', egressText(d.egresses)));
+    box.appendChild(row);
+  }
+}
+
+async function checkApp(a) {
+  const box = $('app-check');
+  box.hidden = false;
+  box.textContent = '';
+  box.appendChild(el('p', 'empty', '正在核对 ' + a.name + '…'));
+  try {
+    const r = await api('/api/apps/check?key=' + encodeURIComponent(a.key));
+    box.textContent = '';
+    box.appendChild(el('h3', null, a.name + ' · 选定 ' + r.egress_display + ' · ' + windowText(r.since)));
+    const domains = r.domains || [];
+    const suspects = r.suspects || [];
+    if (!domains.length) {
+      box.appendChild(el('p', 'empty', '这段时间还没有 ' + a.name + ' 的转发记录。用手机打开 ' + a.name + ' 用一会儿再核对。'));
+    } else if (r.mismatch) {
+      box.appendChild(el('p', 'verdict bad', r.mismatch + ' 个域名有连接没走 ' + r.egress_display + '，灰字是当时命中的规则'));
+    } else {
+      box.appendChild(el('p', 'verdict', domains.length + ' 个域名全部经 ' + r.egress_display + ' ✓'));
+    }
+    checkRows(box, domains);
+    if (suspects.length) {
+      box.appendChild(el('p', 'verdict bad', '疑似漏网：下面的域名带有 ' + a.name + ' 特征，但不在清单里，也没走 ' + r.egress_display));
+      checkRows(box, suspects);
+    }
+  } catch (err) {
+    box.textContent = '';
+    box.appendChild(el('p', 'empty warning', err.message));
+  }
+}
+
+async function loadApps() {
+  try {
+    renderApps(await api('/api/apps'));
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
 // ---------- 诊断 ----------
 
 const STAGE_NAMES = {
@@ -425,6 +548,7 @@ $('rule-input').addEventListener('keydown', (event) => {
 
 loadStatus();
 loadRules();
+loadApps();
 setInterval(loadStatus, 15000);
 
 // ---------- 健康监控 ----------
