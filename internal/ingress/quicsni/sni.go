@@ -53,7 +53,10 @@ type quicVersion struct {
 	initialType byte // 长包头 Type 字段中 Initial 的取值
 }
 
-// RFC 9001 §5.2（v1）与 RFC 9369 §3.3.1 / §5.8（v2）。
+// RFC 9001 §5.2（v1）、RFC 9369 §3.3.1 / §5.8（v2）与 draft-ietf-quic-tls-29 §5.2。
+//
+// draft-29 至 draft-32 共用同一个 salt，标签与包结构和 v1 相同。Chromium 系
+// 客户端（TikTok 的 TTNet 等）会按服务端下发的配置对部分域名改用 h3-29。
 var (
 	versionV1 = quicVersion{
 		salt: []byte{
@@ -71,7 +74,18 @@ var (
 		keyLabel: "quicv2 key", ivLabel: "quicv2 iv", hpLabel: "quicv2 hp",
 		initialType: 0x01,
 	}
+	versionDraft29 = quicVersion{
+		salt: []byte{
+			0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97,
+			0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0, 0x43, 0x90, 0xa8, 0x99,
+		},
+		keyLabel: "quic key", ivLabel: "quic iv", hpLabel: "quic hp",
+		initialType: 0x00,
+	}
 )
+
+// supportedVersions 是版本协商时告知客户端的版本，按优先顺序排列。
+var supportedVersions = []uint32{0x00000001, 0x6b3343cf, 0xff00001d}
 
 func lookupVersion(v uint32) (quicVersion, bool) {
 	switch v {
@@ -79,9 +93,50 @@ func lookupVersion(v uint32) (quicVersion, bool) {
 		return versionV1, true
 	case 0x6b3343cf:
 		return versionV2, true
+	case 0xff00001d, 0xff00001e, 0xff00001f, 0xff000020:
+		return versionDraft29, true
 	default:
 		return quicVersion{}, false
 	}
+}
+
+// minInitialDatagram 是客户端首个 Initial 数据报的最小长度（RFC 9000 §14.1）。
+const minInitialDatagram = 1200
+
+// VersionNegotiation 为使用未知版本发起连接的客户端数据报构造版本协商包
+// （RFC 9000 §6.1、§17.2.1），让客户端立即改用支持的版本或回落 TCP，而不是
+// 在静默丢包后一直重试到超时。数据报不是这种情况时返回 nil。
+func VersionNegotiation(datagram []byte) []byte {
+	if len(datagram) < minInitialDatagram || datagram[0]&0x80 == 0 {
+		return nil
+	}
+	ver := binary.BigEndian.Uint32(datagram[1:5])
+	if _, ok := lookupVersion(ver); ok || ver == 0 {
+		return nil
+	}
+	i := 5
+	dcidLen := int(datagram[i])
+	if i+1+dcidLen >= len(datagram) {
+		return nil
+	}
+	dcid := datagram[i+1 : i+1+dcidLen]
+	i += 1 + dcidLen
+	scidLen := int(datagram[i])
+	if i+1+scidLen > len(datagram) {
+		return nil
+	}
+	scid := datagram[i+1 : i+1+scidLen]
+
+	out := make([]byte, 0, 7+len(dcid)+len(scid)+4*len(supportedVersions))
+	out = append(out, 0x80|0x40|(datagram[0]&0x3f), 0, 0, 0, 0)
+	out = append(out, byte(len(scid)))
+	out = append(out, scid...)
+	out = append(out, byte(len(dcid)))
+	out = append(out, dcid...)
+	for _, v := range supportedVersions {
+		out = binary.BigEndian.AppendUint32(out, v)
+	}
+	return out
 }
 
 // IsLongHeader 报告数据报首字节是否为 QUIC 长包头。

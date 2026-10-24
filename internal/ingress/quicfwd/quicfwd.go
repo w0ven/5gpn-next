@@ -15,6 +15,7 @@ package quicfwd
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"log"
 	"net"
@@ -271,6 +272,11 @@ func (sc *session) onDatagram(ctx context.Context, pc net.PacketConn, dg []byte)
 		// 非 Initial / 未知版本 / 结构异常：本会话无法接管。
 		if sc.dec.Packets() == 0 {
 			sc.mu.Unlock()
+			if vn := quicsni.VersionNegotiation(dg); vn != nil {
+				_, _ = pc.WriteTo(vn, sc.client)
+				sc.abort("QUIC 版本 0x%08x 不支持，已回复版本协商", binary.BigEndian.Uint32(dg[1:5]))
+				return
+			}
 			sc.abort("无法解析 QUIC Initial：%v", err)
 			return
 		}
