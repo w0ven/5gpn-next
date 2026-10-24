@@ -478,7 +478,9 @@ function renderHealth(h) {
     ['QUIC 会话', h.quic.max ? (h.quic.active + ' / ' + h.quic.max) : '未启用'],
     ['内存', (h.sys.memory_mb || 0).toFixed(1) + ' MB'],
     ['goroutine', String(h.sys.goroutines)],
-    ['证书剩余', h.sys.cert_days >= 0 ? (h.sys.cert_days + ' 天') : '—'],
+    ['证书剩余', typeof h.sys.cert_days !== 'number' ? '—'
+      : h.sys.cert_days < 0 ? ('已过期 ' + (-h.sys.cert_days) + ' 天')
+      : (h.sys.cert_days + ' 天')],
   ];
   for (const [k, v2] of stats) {
     const s = el('div', 'stat');

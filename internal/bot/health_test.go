@@ -111,3 +111,24 @@ func TestFormatUSHasNoHTMLSpecialChars(t *testing.T) {
 		}
 	}
 }
+
+// 证书过期时整行曾被隐藏，恰好在最需要提示的时候什么都不显示。
+func TestCertHealthLine(t *testing.T) {
+	cases := []struct {
+		days int
+		want string
+	}{
+		{80, "🔐 证书剩余　<b>80 天</b>"},
+		{14, "⚠️ 证书剩余　<b>14 天</b>"},
+		{0, "⚠️ 证书剩余　<b>0 天</b>"},
+		{-1, "🚨 证书已过期　<b>1 天</b>"},
+		{-29, "🚨 证书已过期　<b>29 天</b>"},
+	}
+	for _, c := range cases {
+		got := certHealthLine(c.days)
+		if got != c.want {
+			t.Errorf("certHealthLine(%d) = %q, want %q", c.days, got, c.want)
+		}
+		assertTelegramHTML(t, got)
+	}
+}
