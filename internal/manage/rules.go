@@ -144,11 +144,9 @@ func (m *Manager) normalizeActionLocked(act string) (string, error) {
 	case "proxy":
 		return "proxy", nil
 	}
-	name := act
-	if n, ok := strings.CutPrefix(act, "proxy:"); ok {
-		name = n
-	} else if n, ok := strings.CutPrefix(strings.ToLower(act), "proxy:"); ok {
-		name = n
+	name, prefixed := act, false
+	if len(act) > 6 && strings.EqualFold(act[:6], "proxy:") {
+		name, prefixed = act[6:], true
 	}
 	name = strings.TrimSpace(name)
 	// 允许用展示名或不区分大小写的出口名：用户照着界面上看到的名字写，
@@ -167,8 +165,10 @@ func (m *Manager) normalizeActionLocked(act string) (string, error) {
 	for _, e := range m.Cfg.Egress {
 		names = append(names, e.Name)
 	}
-	return "", fmt.Errorf("动作 %q 无效。可用：direct（手机直连）· block（拦截）· proxy（默认出口）· proxy:出口名（%s）",
-		act, strings.Join(names, " · "))
+	if prefixed {
+		return "", fmt.Errorf("出口 %s 不存在，可用：%s", name, strings.Join(names, " · "))
+	}
+	return "", fmt.Errorf("动作 %q 无效，可用 direct · block · proxy · proxy:出口名", act)
 }
 
 func (m *Manager) ruleSetKnownLocked(name string) bool {
@@ -221,6 +221,9 @@ func (m *Manager) ruleEffectLocked(rule string) string {
 		return "已添加：匹配的流量" + what
 	}
 	dec := m.Policy.MatchResolved(t, nil)
+	if dec.Index < 0 {
+		return "已添加：匹配的流量" + what
+	}
 	if dec.Rule != kind+","+val {
 		return fmt.Sprintf("已添加，但 %s 会先命中内置规则 %s，这条规则对它不生效", sample, dec.Rule)
 	}

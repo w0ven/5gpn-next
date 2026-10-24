@@ -46,7 +46,7 @@
 
 | | 能力 | 说明 |
 | :--: | :--- | :--- |
-| 🧭 | **服务端分流** | `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`、`RULE-SET`、`GEOIP`、`FINAL` 有序匹配 |
+| 🧭 | **服务端分流** | `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`、`RULE-SET`、`GEOIP` 有序匹配，未命中的走默认出口 |
 | 🌐 | **多出口** | 本机 `DIRECT`，或通过 mihomo 接入 SS / VLESS / VMess / Trojan / Hysteria2 / TUIC 等节点 |
 | 🛡️ | **DNS 广告拦截** | 命中后返回 NXDOMAIN，支持白名单、自定义规则覆盖、成功次数、最近记录与高频域名统计 |
 | 🤖 | **Telegram Bot** | 查看状态与流量、管理出口与规则、下发描述文件、广告拦截、诊断、升级与回退 |
@@ -187,6 +187,14 @@ https://<网关域名>:<gateway.listen 端口>/
 
 面板只接受 `client_cidr` 内的来源，**不要把该端口额外开放给公网**。
 
+查看免登录；修改设置需要先登录：在 Bot「接入 → 面板登录」获取一次性链接（10 分钟内有效，只能用一次），没有配置 Bot 时在服务器上运行：
+
+```bash
+5gpnd panel-login -c /etc/5gpn-next/config.json
+```
+
+登录后这台设备 30 天内不用再登录。
+
 ### ⌨️ 命令行
 
 ```bash
@@ -256,20 +264,30 @@ tail -f /var/log/5gpn-next/trace.jsonl
 DOMAIN,example.com,direct
 DOMAIN-SUFFIX,openai.com,proxy:node
 DOMAIN-KEYWORD,ads,block
-IP-CIDR,203.0.113.0/24,proxy:node
+IP-CIDR,203.0.113.0/24,proxy
 RULE-SET,cn-domain,direct
 GEOIP,cn,direct
-FINAL,,proxy:node
 ```
 
+动作的含义：
+
+| 动作 | 去向 |
+|:--|:--|
+| `direct` | 网关把真实 IP 交给手机，由手机直连（适合国内站点） |
+| `block` | 拦截 |
+| `proxy` | 经网关、走当前默认出口 |
+| `proxy:出口名` | 经网关、走指定出口（可写出口名或面板上显示的名字） |
+| `proxy:DIRECT` | 经网关、由网关本机公网出口直出 |
+
 ```text
-优先级：内置私网保护 → 用户自定义规则 → 广告白名单 → 广告规则 → 国内直连兜底 → FINAL
+优先级：内置私网保护 → 用户自定义规则 → 广告白名单 → 广告规则 → 应用分流 → 国内直连兜底 → 默认出口
 ```
 
 - 🔒 **内置私网保护**始终最优先，任何自定义规则都不能把私网地址导向外部出口；
 - ✏️ **用户自定义规则**可覆盖普通国内域名和广告规则；
 - 🇨🇳 **国内域名 + GEOIP CN**作为后置直连兜底；
-- 🎯 **FINAL**只决定其余未命中流量的默认出口。
+- 🎯 **默认出口**在 Bot / 面板的「出口」里切换，不能写成 `FINAL` 规则。
+- ✅ Bot / 面板添加规则时会先校验类型和出口名，并告诉你这条规则实际让流量走哪里；被内置规则抢先命中、不会生效时也会说明。
 
 ---
 
@@ -281,6 +299,8 @@ FINAL,,proxy:node
 <br>
 
 确认域名 A 记录指向本机、TCP/80 可达；使用 Cloudflare 时应为灰云。已有证书可直接复用。
+
+网关运行后会把 certbot 的续期方式改为由网关自己在 80 端口应答验证（原配置备份为 `/etc/letsencrypt/renewal/<域名>.conf.5gpn-standalone`），续期期间不再停服，新证书自动热加载。续期失败时 Bot 会立即提醒。卸载或回退到旧版本时会自动还原原配置。
 </details>
 
 <details>
@@ -300,7 +320,7 @@ FINAL,,proxy:node
 5gpnd probe -c /etc/5gpn-next/config.json youtube.com
 ```
 
-如果没有配置可用代理出口，`FINAL` 为 `direct` 时会使用网关本机公网出口。
+如果没有配置可用代理出口，默认出口为网关本机时会由网关本机公网出口直出。
 </details>
 
 <details>
@@ -331,7 +351,8 @@ FINAL,,proxy:node
 
 - 🔑 描述文件下载路径含随机串，应按凭据保管；
 - 👤 Bot 只响应 `bot.admins` 中列出的 Telegram 数字 ID；
-- 🔥 内网面板和接管端口应只允许 `client_cidr` 访问；
+- 🔥 内网面板和接管端口应只允许 `client_cidr` 访问；面板修改设置需要一次性链接登录；
+- 🚧 接管入口只代为连接公网地址，不会替客户端访问网关本机或内网服务；
 - 🙈 配置、节点链接、Bot Token 与生产部署文件不得提交到 Git；
 - 🔐 项目不生成或下发根 CA，不解密用户 TLS 流量；
 - 📉 网关转发流量只保存聚合数据；不包含手机本地直连流量。连接级诊断日志按容量轮转，不会无限增长。

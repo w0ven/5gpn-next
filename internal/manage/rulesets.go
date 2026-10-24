@@ -29,7 +29,11 @@ func (s RuleSetState) Failing() bool { return s.Check.Fails > 0 }
 // RuleSetStates 返回当前生效的全部规则集及其更新状态。
 func (m *Manager) RuleSetStates() []RuleSetState {
 	sets := m.EffectiveRuleSets()
-	f := ruleset.NewFetcher(ruleSetDir)
+	dir := m.RuleSetDir
+	if dir == "" {
+		dir = ruleSetDir
+	}
+	f := ruleset.NewFetcher(dir)
 	statuses := f.Statuses()
 
 	m.mu.RLock()

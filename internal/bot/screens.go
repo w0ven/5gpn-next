@@ -522,7 +522,8 @@ func (b *Bot) askRuleAdd(ctx context.Context, v view, errNote string) {
 	sb.WriteString(head("route", "添加规则"))
 	sb.WriteString("格式　<code>类型,值,动作</code>\n")
 	sb.WriteString("动作　<code>direct</code> 手机直连（国内）· <code>block</code> 拦截\n")
-	sb.WriteString("　　　<code>proxy</code> 默认出口 · <code>proxy:出口名</code> 指定出口 · <code>proxy:DIRECT</code> 网关本机直出\n")
+	sb.WriteString("　　　<code>proxy</code> 默认出口 · <code>proxy:出口名</code>\n")
+	sb.WriteString("　　　<code>proxy:DIRECT</code> 网关本机直出\n")
 	var names []string
 	for _, n := range b.Manager.SortedEgressNames() {
 		if n != "DIRECT" {

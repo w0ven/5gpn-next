@@ -68,6 +68,9 @@ type Manager struct {
 	// Health 是内置健康监控（可为空）
 	Health *monitor.Monitor
 
+	// RuleSetDir 是规则集缓存目录，为空时用默认位置。
+	RuleSetDir string
+
 	// FetchRuleSet 在缓存缺失时下载规则集（可为空）。
 	FetchRuleSet func(ctx context.Context, name, url string) error
 
