@@ -1,8 +1,11 @@
 // Package bot 实现 Telegram 管理机器人（纯标准库，长轮询）。
 //
 // 交互原则：
-//   - 点击按钮就地更新原消息，不堆叠新消息；只有发送文件、执行结果这类
-//     确实需要留痕的动作才新发一条。
+//   - 聊天里始终只有一个「屏幕」消息：导航一律就地编辑；新开一屏时删掉
+//     旧屏。用户发来的命令与输入在读取后立即删除（节点链接含凭据）。
+//   - 轻操作的结果用按钮上方的轻提示反馈，出错用弹窗，不跳转错误页。
+//   - 主动推送的通知带「知道了」按钮，点了即删；点通知里的入口，该通知
+//     就地变成新的屏幕。
 //   - 只接受配置中列出的管理员 ID；其它来源静默忽略，不回任何内容。
 //   - 一律使用 HTML parse_mode。域名与节点名常含 - _ . 等字符，
 //     MarkdownV2 需逐字符转义，漏一个即整条发送失败。
@@ -11,28 +14,22 @@ package bot
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"html"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/w0ven/5gpn-next/internal/config"
 	"github.com/w0ven/5gpn-next/internal/manage"
-	"github.com/w0ven/5gpn-next/internal/qrcode"
-	"github.com/w0ven/5gpn-next/internal/stats"
-	updatepkg "github.com/w0ven/5gpn-next/internal/update"
 )
 
 // Bot 是 Telegram 管理机器人。
@@ -47,6 +44,9 @@ type Bot struct {
 
 	client *http.Client
 	offset int64
+	// apiBase 与 state 只在测试中替换。
+	apiBase string
+	state   string
 
 	mu sync.Mutex
 	// pending 记录等待用户输入的动作：chatID -> action
@@ -55,45 +55,71 @@ type Bot struct {
 	promptMsg map[int64]int64
 	// greeted 标记已经打过招呼的管理员，避免重复补发欢迎语
 	greeted map[int64]bool
-	// lastScreen 记录每个会话当前的「屏幕」消息 ID。用户反复 /start
-	// 或命令新开一屏时，删掉旧屏，保证聊天里始终只有一个活动菜单，
-	// 不堆叠僵尸界面。
-	lastScreen map[int64]int64
+	// screens 记录每个会话当前的屏幕消息 ID，落盘以便升级重启后仍能收起旧屏。
+	screens map[int64]int64
+	// files 记录每个会话最近下发的文件消息（描述文件、二维码），重新获取时先删旧的。
+	files map[int64][]int64
+	// degrade 是按钮降级级别：1 去掉图标，2 再去掉配色。被拒后保持一小时，
+	// 期间不再反复试探；过期后重新尝试完整按钮，避免一次偶发失败永久降级。
+	degrade   int
+	degradeAt time.Time
 	// pendingGreet 为 true 时表示启动通知没送达，等用户首次交互再补
 	pendingGreet bool
 }
+
+const stateDir = "/var/lib/5gpn-next"
 
 // offsetFile 持久化长轮询 offset。
 //
 // 升级/回退会重启本进程；若 offset 只存内存，Telegram 会把
 // 尚未确认的「立即升级」回调重投给新进程，形成升级→重启→再升级
 // 的死循环。落盘后重启不再重放已处理的更新。
-const offsetFile = "/var/lib/5gpn-next/bot-offset"
+const offsetFile = "bot-offset"
+
+const screensFile = "bot-screens.json"
+
+func (b *Bot) statePath(name string) string { return filepath.Join(b.state, name) }
 
 // New 构造 Bot。
 func New(token string, admins []int64, m *manage.Manager, version string) *Bot {
 	b := &Bot{
-		Token:      token,
-		Admins:     admins,
-		Manager:    m,
-		Version:    version,
-		client:     &http.Client{Timeout: 70 * time.Second},
-		pending:    make(map[int64]string),
-		promptMsg:  make(map[int64]int64),
-		lastScreen: make(map[int64]int64),
-		greeted:    make(map[int64]bool),
+		Token:     token,
+		Admins:    admins,
+		Manager:   m,
+		Version:   version,
+		client:    &http.Client{Timeout: 70 * time.Second},
+		apiBase:   "https://api.telegram.org",
+		state:     stateDir,
+		pending:   make(map[int64]string),
+		promptMsg: make(map[int64]int64),
+		screens:   make(map[int64]int64),
+		files:     make(map[int64][]int64),
+		greeted:   make(map[int64]bool),
 	}
-	if raw, err := os.ReadFile(offsetFile); err == nil {
+	if raw, err := os.ReadFile(b.statePath(offsetFile)); err == nil {
 		if n, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64); err == nil && n > 0 {
 			b.offset = n
 		}
 	}
+	if raw, err := os.ReadFile(b.statePath(screensFile)); err == nil {
+		_ = json.Unmarshal(raw, &b.screens)
+	}
 	return b
+}
+
+// commands 是输入框左侧的命令菜单。
+var commands = []struct{ cmd, desc string }{
+	{"start", "主页"},
+	{"status", "运行状态"},
+	{"egress", "出口"},
+	{"rules", "分流"},
+	{"probe", "连通诊断"},
 }
 
 // Run 启动长轮询，直到 ctx 取消。
 func (b *Bot) Run(ctx context.Context) {
 	log.Printf("Telegram Bot 已启动，管理员 %v", b.Admins)
+	b.setCommands(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -112,6 +138,23 @@ func (b *Bot) Run(ctx context.Context) {
 		for _, u := range updates {
 			b.handle(ctx, u)
 		}
+	}
+}
+
+func (b *Bot) setCommands(ctx context.Context) {
+	type c struct {
+		Command     string `json:"command"`
+		Description string `json:"description"`
+	}
+	list := make([]c, 0, len(commands))
+	for _, x := range commands {
+		list = append(list, c{x.cmd, x.desc})
+	}
+	raw, _ := json.Marshal(list)
+	p := url.Values{}
+	p.Set("commands", string(raw))
+	if _, err := b.api(ctx, "setMyCommands", p); err != nil {
+		log.Printf("Bot 设置命令菜单失败: %v", err)
 	}
 }
 
@@ -145,7 +188,7 @@ type update struct {
 }
 
 func (b *Bot) api(ctx context.Context, method string, params url.Values) ([]byte, error) {
-	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/%s", b.Token, method)
+	endpoint := fmt.Sprintf("%s/bot%s/%s", b.apiBase, b.Token, method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint,
 		strings.NewReader(params.Encode()))
 	if err != nil {
@@ -198,27 +241,93 @@ func (b *Bot) getUpdates(ctx context.Context) ([]update, error) {
 	// 在处理任何更新之前先落盘：即便处理过程中进程被重启
 	//（典型：自升级），这批更新也不会被 Telegram 重投。
 	if advanced {
-		_ = os.MkdirAll("/var/lib/5gpn-next", 0o750)
-		_ = os.WriteFile(offsetFile, []byte(strconv.FormatInt(b.offset, 10)+"\n"), 0o640)
+		_ = os.MkdirAll(b.state, 0o750)
+		_ = os.WriteFile(b.statePath(offsetFile), []byte(strconv.FormatInt(b.offset, 10)+"\n"), 0o640)
 	}
 	return ups, nil
 }
+
+// ---------- 屏幕与消息 ----------
 
 // view 描述一屏内容。
 type view struct {
 	chatID int64
 	// msgID 非 0 时就地编辑该消息，否则新发一条
 	msgID int64
+	// cb 非空表示由按钮触发，可用轻提示反馈
+	cb *callback
 }
 
-// render 渲染一屏：能编辑就编辑，避免消息越堆越多。
+type callback struct {
+	id   string
+	once sync.Once
+}
+
+// ackGrace 之后仍未给出轻提示，就先应答掉按钮的转圈状态，长操作不让按钮一直转。
+const ackGrace = 1200 * time.Millisecond
+
+// ack 应答按钮点击；每次点击只有第一次应答生效。text 为空时只收起转圈。
+func (b *Bot) ack(ctx context.Context, v view, text string, alert bool) {
+	if v.cb == nil {
+		return
+	}
+	v.cb.once.Do(func() {
+		p := url.Values{}
+		p.Set("callback_query_id", v.cb.id)
+		if text != "" {
+			p.Set("text", truncateText(text, 190))
+		}
+		if alert {
+			p.Set("show_alert", "true")
+		}
+		_, _ = b.api(ctx, "answerCallbackQuery", p)
+	})
+}
+
+// fail 报告一次操作失败：按钮触发时弹窗、屏幕保持不变；文字输入触发时
+// 屏幕换成错误说明并给出返回入口。
+func (b *Bot) fail(ctx context.Context, v view, title string, err error, back string) {
+	if v.cb != nil {
+		b.ack(ctx, v, title+"："+err.Error(), true)
+		return
+	}
+	b.render(ctx, v, errBox(title, err), backTo(back))
+}
+
+// render 渲染一屏：能编辑就编辑，否则新发；并把它设为该会话唯一的屏幕。
 func (b *Bot) render(ctx context.Context, v view, text, keyboard string) int64 {
-	id := b.renderOnce(ctx, v, text, keyboard)
-	if id == 0 && strings.Contains(keyboard, buttonIconField) {
-		// 按钮图标要求 Bot 主人有 Premium；被拒时去掉图标重发，不让整屏发不出去。
-		id = b.renderOnce(ctx, v, text, stripButtonIcons(keyboard))
+	id := b.withDegrade(keyboard, func(kb string) int64 { return b.renderOnce(ctx, v, text, kb) })
+	if id != 0 {
+		b.setScreen(ctx, v.chatID, id)
 	}
 	return id
+}
+
+// withDegrade 按当前降级级别发送；失败且键盘里还有可降级的字段时逐级降级重试。
+// 按钮图标要求 Bot 主人有 Premium，配色要求较新的 Bot API。
+func (b *Bot) withDegrade(keyboard string, send func(string) int64) int64 {
+	b.mu.Lock()
+	if b.degrade > 0 && time.Since(b.degradeAt) > time.Hour {
+		b.degrade = 0
+	}
+	level := b.degrade
+	b.mu.Unlock()
+	for ; level <= len(buttonExtras); level++ {
+		kb := stripButtonExtras(keyboard, buttonExtras[:level]...)
+		if id := send(kb); id != 0 {
+			b.mu.Lock()
+			if level > b.degrade {
+				b.degrade, b.degradeAt = level, time.Now()
+				log.Printf("Bot 按钮不支持 %v，已降级", buttonExtras[:level])
+			}
+			b.mu.Unlock()
+			return id
+		}
+		if !hasButtonExtras(kb) {
+			break
+		}
+	}
+	return 0
 }
 
 func (b *Bot) renderOnce(ctx context.Context, v view, text, keyboard string) int64 {
@@ -243,18 +352,36 @@ func (b *Bot) renderOnce(ctx context.Context, v view, text, keyboard string) int
 		}
 		// 其它编辑失败（消息过旧、被删除等）时退回新发，不让用户卡住
 	}
-	id := b.send(ctx, v.chatID, text, keyboard)
-	if id != 0 {
-		// 新开一屏成功：删除上一屏，聊天里只保留一个活动界面。
-		b.mu.Lock()
-		old := b.lastScreen[v.chatID]
-		b.lastScreen[v.chatID] = id
-		b.mu.Unlock()
-		if old != 0 && old != id {
-			b.deleteMessage(ctx, v.chatID, old)
-		}
+	return b.send(ctx, v.chatID, text, keyboard)
+}
+
+// setScreen 把 id 记为当前屏幕，并删掉上一屏。
+func (b *Bot) setScreen(ctx context.Context, chatID, id int64) {
+	b.mu.Lock()
+	old := b.screens[chatID]
+	changed := old != id
+	if changed {
+		b.screens[chatID] = id
 	}
-	return id
+	snapshot, _ := json.Marshal(b.screens)
+	b.mu.Unlock()
+	if !changed {
+		return
+	}
+	if old != 0 {
+		b.deleteMessage(ctx, chatID, old)
+	}
+	_ = os.WriteFile(b.statePath(screensFile), snapshot, 0o640)
+}
+
+// dropMessage 删除一条消息；若它正是当前屏幕，同时清掉记录。
+func (b *Bot) dropMessage(ctx context.Context, chatID, id int64) {
+	b.mu.Lock()
+	if b.screens[chatID] == id {
+		delete(b.screens, chatID)
+	}
+	b.mu.Unlock()
+	b.deleteMessage(ctx, chatID, id)
 }
 
 // deleteMessage 尽力删除消息；失败（过旧、已删）静默忽略。
@@ -300,27 +427,28 @@ func (b *Bot) send(ctx context.Context, chatID int64, text, keyboard string) int
 	return r.MessageID
 }
 
-// toast 在按钮上方弹出轻提示，不产生新消息。
-func (b *Bot) toast(ctx context.Context, id, text string, alert bool) {
-	p := url.Values{}
-	p.Set("callback_query_id", id)
-	if text != "" {
-		p.Set("text", text)
-	}
-	if alert {
-		p.Set("show_alert", "true")
-	}
-	_, _ = b.api(ctx, "answerCallbackQuery", p)
+// EditMessage 编辑指定消息（供升级结果等跨进程场景使用）。
+func (b *Bot) EditMessage(ctx context.Context, chatID, msgID int64, text, keyboard string) {
+	b.render(ctx, view{chatID: chatID, msgID: msgID}, text, keyboard)
 }
 
-// Notify 主动推送给所有管理员。
+// Notify 主动推送给所有管理员，附「知道了」按钮。
 //
 // 若全部投递失败（常见于 Bot 刚创建、用户尚未 /start），
 // 标记待补发，等用户首次交互时再送出。
 func (b *Bot) Notify(ctx context.Context, text string) {
+	b.notify(ctx, text, inlineKeyboard([]btn{dismissBtn()}))
+}
+
+// NotifyAction 推送通知并附一个入口按钮：点击后该通知就地变成对应页面。
+func (b *Bot) NotifyAction(ctx context.Context, text, label, cmd, iconName string) {
+	b.notify(ctx, text, inlineKeyboard([]btn{{Text: label, Data: cmd, Icon: iconName}, dismissBtn()}))
+}
+
+func (b *Bot) notify(ctx context.Context, text, keyboard string) {
 	delivered := false
 	for _, id := range b.Admins {
-		if b.send(ctx, id, text, "") != 0 {
+		if b.withDegrade(keyboard, func(kb string) int64 { return b.send(ctx, id, text, kb) }) != 0 {
 			delivered = true
 		}
 	}
@@ -352,8 +480,20 @@ func (b *Bot) handle(ctx context.Context, u update) {
 		if !b.isAdmin(q.From.ID) || q.Message == nil {
 			return
 		}
-		b.toast(ctx, q.ID, "", false)
-		b.dispatch(ctx, view{chatID: q.Message.Chat.ID, msgID: q.Message.MessageID}, q.Data)
+		v := view{chatID: q.Message.Chat.ID, msgID: q.Message.MessageID, cb: &callback{id: q.ID}}
+		// 点了别的按钮就不再等待之前的输入；需要输入的页面会重新登记。
+		b.mu.Lock()
+		delete(b.pending, v.chatID)
+		delete(b.promptMsg, v.chatID)
+		b.mu.Unlock()
+		t := time.AfterFunc(ackGrace, func() {
+			actx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			b.ack(actx, v, "", false)
+		})
+		b.dispatch(ctx, v, q.Data)
+		t.Stop()
+		b.ack(ctx, v, "", false)
 
 	case u.Message != nil:
 		m := u.Message
@@ -364,7 +504,8 @@ func (b *Bot) handle(ctx context.Context, u update) {
 		if text == "" {
 			return
 		}
-
+		// 命令只是导航，输入可能含节点凭据：读取后都不留在聊天里。
+		b.deleteMessage(ctx, m.Chat.ID, m.MessageID)
 		b.maybeGreet(ctx, m.Chat.ID)
 
 		// 等待输入状态优先
@@ -381,9 +522,19 @@ func (b *Bot) handle(ctx context.Context, u update) {
 			b.handleInput(ctx, view{chatID: m.Chat.ID, msgID: promptID}, action, text)
 			return
 		}
-		// 用户主动发命令：新开一屏
-		b.dispatch(ctx, view{chatID: m.Chat.ID}, strings.TrimPrefix(text, "/"))
+		// 用户主动发命令：在底部新开一屏，旧屏随之删除
+		b.dispatch(ctx, view{chatID: m.Chat.ID}, commandOf(text))
 	}
+}
+
+// commandOf 把 "/probe@MyBot youtube.com" 规整为 "probe youtube.com"。
+func commandOf(text string) string {
+	cmd, arg, _ := strings.Cut(strings.TrimPrefix(text, "/"), " ")
+	cmd, _, _ = strings.Cut(cmd, "@")
+	if arg = strings.TrimSpace(arg); arg != "" {
+		return cmd + " " + arg
+	}
+	return cmd
 }
 
 // maybeGreet 在首次交互时补发启动通知。
@@ -402,1544 +553,333 @@ func (b *Bot) maybeGreet(ctx context.Context, chatID int64) {
 	}
 	// 瞬态提示：60 秒后自毁，不在聊天里留痕。
 	b.sendEphemeral(ctx, chatID, fmt.Sprintf(
-		"✅ <b>5gpn-NEXT 已就绪</b>\n\n"+
-			"版本  <code>%s</code>\n"+
-			"服务已在运行，随时可以开始配置。",
-		html.EscapeString(b.Version)), 60*time.Second)
+		"%s <b>5gpn-NEXT 已就绪</b>　<code>%s</code>", ic("ok"), esc(b.Version)), 60*time.Second)
 }
 
 func (b *Bot) dispatch(ctx context.Context, v view, cmd string) {
-	switch {
-	case cmd == "start", cmd == "menu":
+	verb, arg, _ := strings.Cut(cmd, ":")
+	switch verb {
+	case "start", "menu":
 		b.showMenu(ctx, v)
-	case cmd == "status":
-		b.showStatus(ctx, v)
-	case cmd == "traffic":
+	case "dismiss":
+		b.dropMessage(ctx, v.chatID, v.msgID)
+	case "cancel":
+		b.mu.Lock()
+		delete(b.pending, v.chatID)
+		delete(b.promptMsg, v.chatID)
+		b.mu.Unlock()
+		b.dispatch(ctx, v, orDefault(arg, "menu"))
+
+	// 状态
+	case "status":
+		b.showStatus(ctx, v, "")
+	case "refresh":
+		b.ack(ctx, v, "已刷新", false)
+		b.dispatch(ctx, v, arg)
+	case "traffic":
 		b.showTraffic(ctx, v)
-	case cmd == "egress":
-		b.showEgress(ctx, v)
-	case cmd == "health":
+	case "health":
 		b.showHealth(ctx, v)
-	case strings.HasPrefix(cmd, "health_detail:"):
-		b.showHealthDetail(ctx, v, strings.TrimPrefix(cmd, "health_detail:"))
-	case cmd == "rules":
+	case "health_detail":
+		b.showHealthDetail(ctx, v, arg)
+	case "monitor_settings":
+		b.showMonitorSettings(ctx, v)
+	case "monitor_toggle_alerts":
+		_, _, disabled := b.Manager.MonitorSettings()
+		on := !disabled
+		if err := b.Manager.SetMonitorAlerts(0, 0, &on); err != nil {
+			b.fail(ctx, v, "设置失败", err, "monitor_settings")
+			return
+		}
+		b.ack(ctx, v, "告警推送已"+onOff(disabled), false)
+		b.showMonitorSettings(ctx, v)
+	case "ask_monitor_after", "ask_monitor_cooldown", "ask_ad_allow", "ask_update_interval":
+		b.askFor(ctx, v, strings.TrimPrefix(verb, "ask_"), "")
+
+	// 出口
+	case "egress":
+		b.showEgress(ctx, v)
+	case "egress_info":
+		b.showEgressInfo(ctx, v, arg, "")
+	case "switch":
+		b.doSwitchEgress(ctx, v, arg)
+	case "test_egress":
+		b.doTestEgress(ctx, v, arg)
+	case "rename_egress":
+		b.ask(ctx, v, "egress_rename|"+arg, head("egress", "重命名出口")+
+			"发送新的显示名称，支持中文与 emoji，24 个字符以内。", "egress_info:"+arg)
+	case "del_egress_ask":
+		b.showEgressInfo(ctx, v, arg, "confirm_delete")
+	case "del_egress":
+		if err := b.Manager.RemoveEgress(arg); err != nil {
+			b.fail(ctx, v, "删除失败", err, "egress")
+			return
+		}
+		b.ack(ctx, v, "已删除出口", false)
+		b.showEgress(ctx, v)
+	case "ask_egress_add":
+		b.ask(ctx, v, "egress_add_name", head("egress", "添加出口", "1 / 2")+
+			"给出口起个名字，例如 <code>东京家宽</code>。\n"+
+			"<i>直接粘贴节点链接可跳过命名，使用节点自带的备注名。</i>", "egress")
+
+	// 分流
+	case "rules":
 		b.showRules(ctx, v)
-	case cmd == "apps":
+	case "rules_builtin":
+		b.showBuiltinRules(ctx, v)
+	case "ask_rule_add":
+		b.askRuleAdd(ctx, v, "")
+	case "rule_del_menu":
+		b.showRuleDelMenu(ctx, v)
+	case "rule_del_ask":
+		b.askRuleDelete(ctx, v, arg)
+	case "rule_del_do":
+		b.doRuleDelete(ctx, v, arg)
+	case "apps":
 		b.showApps(ctx, v)
-	case strings.HasPrefix(cmd, "app:"):
-		b.showApp(ctx, v, strings.TrimPrefix(cmd, "app:"))
-	case strings.HasPrefix(cmd, "app_set:"):
-		b.doSetApp(ctx, v, strings.TrimPrefix(cmd, "app_set:"))
-	case strings.HasPrefix(cmd, "app_check:"):
-		b.showAppCheck(ctx, v, strings.TrimPrefix(cmd, "app_check:"))
-	case cmd == "adblock":
+	case "app":
+		b.showApp(ctx, v, arg, "")
+	case "app_set":
+		b.doSetApp(ctx, v, arg)
+	case "app_check":
+		b.showAppCheck(ctx, v, arg)
+
+	// 广告拦截
+	case "adblock":
 		b.showAdBlock(ctx, v)
-	case cmd == "adblock_on":
+	case "adblock_on":
 		b.doAdBlockToggle(ctx, v, true)
-	case cmd == "adblock_off":
+	case "adblock_off":
 		b.doAdBlockToggle(ctx, v, false)
-	case strings.HasPrefix(cmd, "ad_allow_hit:"):
-		b.doAdAllowHit(ctx, v, strings.TrimPrefix(cmd, "ad_allow_hit:"))
-	case cmd == "ask_ad_allow":
-		b.ask(ctx, v, "ad_allow",
-			"➕ <b>添加广告白名单</b>\n\n"+
-				"某个 App 被误杀（白屏、加载不出来）时，把它的域名加进来。\n\n"+
-				"直接发域名即可，例如：<code>example.com</code>\n"+
-				"会连同子域名一起放行。", "adblock")
-	case cmd == "ad_allow_list":
+	case "ad_allow_hit":
+		b.doAdAllowHit(ctx, v, arg)
+	case "ad_allow_list":
 		b.showAdAllowlist(ctx, v)
-	case strings.HasPrefix(cmd, "ad_allow_del:"):
-		if idx, err := strconv.Atoi(strings.TrimPrefix(cmd, "ad_allow_del:")); err == nil {
-			if err := b.Manager.RemoveAdAllow(idx); err != nil {
-				b.render(ctx, v, errBox("移除失败", err), backTo("ad_allow_list"))
-				return
-			}
+	case "ad_allow_del":
+		idx, _ := strconv.Atoi(arg)
+		if err := b.Manager.RemoveAdAllow(idx); err != nil {
+			b.fail(ctx, v, "移除失败", err, "ad_allow_list")
+			return
 		}
+		b.ack(ctx, v, "已移出白名单", false)
 		b.showAdAllowlist(ctx, v)
-	case cmd == "client":
+
+	// 诊断
+	case "probe", "ask_probe":
+		b.askProbe(ctx, v)
+	case "probe_go":
+		b.doProbe(ctx, v, arg)
+
+	// 接入
+	case "client", "panel", "android_guide":
 		b.showClient(ctx, v)
-	case cmd == "panel":
-		b.showPanel(ctx, v)
-	case cmd == "update":
-		b.showUpdate(ctx, v)
-	case strings.HasPrefix(cmd, "cancel:"):
-		b.mu.Lock()
-		delete(b.pending, v.chatID)
-		delete(b.promptMsg, v.chatID)
-		b.mu.Unlock()
-		b.dispatch(ctx, v, strings.TrimPrefix(cmd, "cancel:"))
-	case cmd == "cancel":
-		b.mu.Lock()
-		delete(b.pending, v.chatID)
-		delete(b.promptMsg, v.chatID)
-		b.mu.Unlock()
-		b.showMenu(ctx, v)
-
-	case cmd == "ask_egress_add":
-		b.ask(ctx, v, "egress_add_name",
-			"➕ <b>添加出口</b> · 第 1 步\n\n"+
-				"给这个出口起个名字（支持中文/emoji），\n"+
-				"例如：<code>东京家宽</code>\n"+
-				"之后出口列表、分流、监控都以这个名字显示。\n\n"+
-				"<i>直接粘贴节点链接可跳过命名，使用节点自带备注名。</i>", "egress")
-	case cmd == "ask_rule_add":
-		b.askRuleAdd(ctx, v)
-	case cmd == "ask_probe":
-		b.ask(ctx, v, "probe",
-			"🩺 <b>连通性诊断</b>\n\n"+
-				"请输入要检测的域名，例如 <code>youtube.com</code>\n\n"+
-				"将逐层检查入口、策略、出口、连接与应用层。", "menu")
-
-	case cmd == "ios_dns_profile":
+	case "ios_dns_profile":
 		b.sendDNSProfile(ctx, v)
-	case cmd == "android_guide":
-		b.showAndroid(ctx, v)
-	case cmd == "update_check":
+
+	// 版本
+	case "update":
+		b.showUpdate(ctx, v)
+	case "update_check":
 		b.doUpdateCheck(ctx, v)
-	case strings.HasPrefix(cmd, "update_ignore:"):
-		if err := b.Manager.IgnoreVersion(strings.TrimPrefix(cmd, "update_ignore:")); err != nil {
-			b.render(ctx, v, errBox("忽略失败", err), backTo("update"))
+	case "update_settings", "update_backups":
+		b.showUpdateSettings(ctx, v)
+	case "update_ignore":
+		if err := b.Manager.IgnoreVersion(arg); err != nil {
+			b.fail(ctx, v, "忽略失败", err, "update")
 			return
 		}
+		b.ack(ctx, v, "已忽略 "+arg, false)
 		b.showUpdate(ctx, v)
-	case strings.HasPrefix(cmd, "update_unignore:"):
-		if err := b.Manager.UnignoreVersion(strings.TrimPrefix(cmd, "update_unignore:")); err != nil {
-			b.render(ctx, v, errBox("操作失败", err), backTo("update"))
-			return
-		}
-		b.showUpdate(ctx, v)
-	case cmd == "update_clear_ignored":
+	case "update_clear_ignored":
 		for _, t := range b.Manager.IgnoredVersions() {
 			_ = b.Manager.UnignoreVersion(t)
 		}
-		b.showUpdate(ctx, v)
-	case cmd == "update_toggle_auto":
+		b.ack(ctx, v, "已清空忽略列表", false)
+		b.showUpdateSettings(ctx, v)
+	case "update_toggle_auto":
 		_, cur, _ := b.Manager.UpdateSettings()
 		if err := b.Manager.SetUpdateAutoApply(!cur); err != nil {
-			b.render(ctx, v, errBox("设置失败", err), backTo("update"))
+			b.fail(ctx, v, "设置失败", err, "update_settings")
 			return
 		}
-		b.showUpdate(ctx, v)
-	case strings.HasPrefix(cmd, "update_apply:"):
-		b.doUpdateApply(ctx, v, strings.TrimPrefix(cmd, "update_apply:"))
-	case cmd == "update_backups":
-		b.showUpdateBackups(ctx, v)
-	case cmd == "update_history":
-		b.showUpdateHistory(ctx, v)
-	case cmd == "ask_update_interval":
-		b.ask(ctx, v, "update_interval",
-			"⏱ <b>调整检查间隔</b>\n\n"+
-				"请输入小时数（1-168），例如 <code>1</code> 或 <code>6</code>。\n\n"+
-				"<i>改动保存后，下次重启起完全生效。</i>", "update")
-	case cmd == "monitor_settings":
-		b.showMonitorSettings(ctx, v)
-	case cmd == "monitor_toggle_alerts":
-		_, _, disabled := b.Manager.MonitorSettings()
-		newVal := !disabled
-		if err := b.Manager.SetMonitorAlerts(0, 0, &newVal); err != nil {
-			b.render(ctx, v, errBox("设置失败", err), backTo("monitor_settings"))
-			return
-		}
-		b.showMonitorSettings(ctx, v)
-	case cmd == "ask_monitor_after":
-		b.ask(ctx, v, "monitor_after",
-			"🚨 <b>连续失败阈值</b>\n\n"+
-				"出口连续多少次探测失败才告警？请输入次数（1-60）。\n\n"+
-				"<i>每次探测间隔 60 秒；3 表示约 3 分钟无响应才提醒。</i>", "monitor_settings")
-	case cmd == "ask_monitor_cooldown":
-		b.ask(ctx, v, "monitor_cooldown",
-			"🔕 <b>告警冷却</b>\n\n"+
-				"同一出口两次告警之间至少间隔多少分钟？请输入分钟数（1-1440）。", "monitor_settings")
-	case cmd == "update_rollback":
+		b.ack(ctx, v, "自动安装已"+onOff(!cur), false)
+		b.showUpdateSettings(ctx, v)
+	case "update_apply":
+		b.doUpdateApply(ctx, v, arg)
+	case "update_rollback":
 		b.showRollback(ctx, v)
-	case strings.HasPrefix(cmd, "rollback:"):
-		b.doRollback(ctx, v, strings.TrimPrefix(cmd, "rollback:"))
-
-	case strings.HasPrefix(cmd, "test_egress:"):
-		b.doTestEgress(ctx, v, strings.TrimPrefix(cmd, "test_egress:"))
-
-	case strings.HasPrefix(cmd, "switch:"):
-		name := strings.TrimPrefix(cmd, "switch:")
-		if err := b.Manager.SwitchEgress(name); err != nil {
-			b.render(ctx, v, errBox("切换失败", err), backTo("egress"))
-			return
-		}
-		b.showEgressInfo(ctx, v, name)
-
-	case strings.HasPrefix(cmd, "egress_info:"):
-		b.showEgressInfo(ctx, v, strings.TrimPrefix(cmd, "egress_info:"))
-	case strings.HasPrefix(cmd, "del_egress_ask:"):
-		name := strings.TrimPrefix(cmd, "del_egress_ask:")
-		b.render(ctx, v, fmt.Sprintf(
-			"🗑 <b>确认删除出口</b> · <code>%s</code>\n\n"+
-				"将停止其代理实例并从列表移除；若为当前兜底出口，自动回落本机直出。\n\n<b>此操作不可撤销。</b>",
-			html.EscapeString(name)),
-			inlineKeyboard(
-				[]btn{{"⚠️ 确认删除", "del_egress:" + name}},
-				[]btn{{"« 取消", "egress_info:" + name}},
-			))
-	case strings.HasPrefix(cmd, "rename_egress:"):
-		name := strings.TrimPrefix(cmd, "rename_egress:")
-		b.ask(ctx, v, "egress_rename|"+name,
-			fmt.Sprintf("✏️ <b>重命名出口</b> · <code>%s</code>\n\n"+
-				"发送新的显示名称（支持中文/emoji，24 字符内）。\n"+
-				"出口列表、分流、监控将统一显示新名字。", html.EscapeString(name)), "egress_info:"+name)
-	case strings.HasPrefix(cmd, "del_egress:"):
-		name := strings.TrimPrefix(cmd, "del_egress:")
-		if err := b.Manager.RemoveEgress(name); err != nil {
-			b.render(ctx, v, errBox("删除失败", err), backTo("egress"))
-			return
-		}
-		b.showEgress(ctx, v)
-
-	case cmd == "rule_del_menu":
-		b.showRuleDelMenu(ctx, v)
-	case strings.HasPrefix(cmd, "rule_del_ask:"):
-		if idx, err := strconv.Atoi(strings.TrimPrefix(cmd, "rule_del_ask:")); err == nil {
-			b.askRuleDelete(ctx, v, idx)
-			return
-		}
-		b.showRules(ctx, v)
-	case strings.HasPrefix(cmd, "rule_del_do:"):
-		b.doRuleDelete(ctx, v, strings.TrimPrefix(cmd, "rule_del_do:"))
+	case "rollback":
+		b.doRollback(ctx, v, arg)
+	case "update_history":
+		b.showUpdateHistory(ctx, v)
 
 	default:
+		// "/probe youtube.com" 这类带参数的命令
+		if c, target, ok := strings.Cut(cmd, " "); ok && c == "probe" {
+			b.doProbe(ctx, v, target)
+			return
+		}
 		b.showMenu(ctx, v)
 	}
 }
 
-func (b *Bot) ask(ctx context.Context, v view, action, prompt string, back ...string) {
-	dest := "menu"
-	if len(back) > 0 && back[0] != "" {
-		dest = back[0]
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
 	}
-	id := b.render(ctx, v, prompt+"\n\n<i>直接发送即可</i>",
-		inlineKeyboard([]btn{{"取消", "cancel:" + dest}}))
+	return s
+}
+
+// ask 把屏幕换成输入提示，等待用户发送文字。errNote 非空时在提示下方
+// 显示上一次输入的问题，继续等待重新输入。
+func (b *Bot) ask(ctx context.Context, v view, action, prompt, back string, errNote ...string) {
+	text := prompt
+	if len(errNote) > 0 && errNote[0] != "" {
+		text += "\n" + ic("warn") + " " + errNote[0]
+	}
+	id := b.render(ctx, v, text, inlineKeyboard([]btn{{Text: "取消", Data: "cancel:" + orDefault(back, "menu")}}))
 	b.mu.Lock()
 	b.pending[v.chatID] = action
 	b.promptMsg[v.chatID] = id
 	b.mu.Unlock()
 }
 
+// prompts 是简单输入项的提示文案与取消后返回的页面。
+var prompts = map[string]struct{ icon, title, body, back string }{
+	"monitor_after": {"alert", "连续失败阈值",
+		"出口连续几次探测失败才告警？发送 1-60 的整数。\n<i>每 60 秒探测一次，3 表示约 3 分钟无响应才提醒。</i>",
+		"monitor_settings"},
+	"monitor_cooldown": {"mute", "告警冷却",
+		"同一出口两次告警至少间隔几分钟？发送 1-1440 的整数。", "monitor_settings"},
+	"ad_allow": {"shield", "加入白名单",
+		"某个 App 被误拦（白屏、加载不出来）时，发送它的域名，例如 <code>example.com</code>。\n<i>连同子域名一起放行。</i>",
+		"ad_allow_list"},
+	"update_interval": {"settings", "检查间隔",
+		"发送 1-168 的小时数，例如 <code>1</code> 或 <code>6</code>。\n<i>下次重启起完全生效。</i>", "update_settings"},
+}
+
+func (b *Bot) askFor(ctx context.Context, v view, action, errNote string) {
+	p := prompts[action]
+	b.ask(ctx, v, action, head(p.icon, p.title)+p.body, p.back, errNote)
+}
+
 func (b *Bot) handleInput(ctx context.Context, v view, action, text string) {
+	text = strings.TrimSpace(text)
 	// 带参数的动作：动作串以 | 携带上一步输入。
 	if name, ok := strings.CutPrefix(action, "egress_add_link|"); ok {
-		b.doEgressAdd(ctx, v, name, strings.TrimSpace(text))
+		b.doEgressAdd(ctx, v, name, text)
 		return
 	}
 	if name, ok := strings.CutPrefix(action, "egress_rename|"); ok {
-		if err := b.Manager.RenameEgress(name, strings.TrimSpace(text)); err != nil {
-			b.render(ctx, v, errBox("改名失败", err), backTo("egress"))
+		if err := b.Manager.RenameEgress(name, text); err != nil {
+			b.ask(ctx, v, action, head("egress", "重命名出口")+"发送新的显示名称。", "egress_info:"+name, esc(err.Error()))
 			return
 		}
-		b.showEgress(ctx, v)
+		b.showEgressInfo(ctx, v, name, "renamed")
 		return
 	}
 	switch action {
 	case "egress_add_name":
-		in := strings.TrimSpace(text)
-		if strings.Contains(in, "://") {
+		if strings.Contains(text, "://") {
 			// 用户直接给了链接：跳过命名，走节点备注名。
-			b.doEgressAdd(ctx, v, "", in)
+			b.doEgressAdd(ctx, v, "", text)
 			return
 		}
-		if len([]rune(in)) > 24 {
-			b.render(ctx, v, errBox("名称过长", fmt.Errorf("请控制在 24 个字符以内")), backTo("egress"))
+		if len([]rune(text)) > 24 {
+			b.ask(ctx, v, action, head("egress", "添加出口", "1 / 2")+"给出口起个名字。", "egress", "名称请控制在 24 个字符以内")
 			return
 		}
-		b.ask(ctx, v, "egress_add_link|"+in,
-			fmt.Sprintf("➕ <b>添加出口</b> · 第 2 步\n\n"+
-				"名称：<b>%s</b>\n\n"+
-				"现在粘贴节点分享链接。\n\n"+
-				"支持：<code>ss</code> <code>vless</code> <code>vmess</code> "+
-				"<code>trojan</code> <code>hysteria2</code> <code>tuic</code> "+
-				"<code>socks5</code> <code>http</code>", html.EscapeString(in)), "egress")
+		b.ask(ctx, v, "egress_add_link|"+text, head("egress", "添加出口", "2 / 2")+
+			fmt.Sprintf("名称　<b>%s</b>\n\n粘贴节点分享链接。\n", esc(text))+
+			"<i>支持 ss · vless · vmess · trojan · hysteria2 · tuic · socks5 · http</i>", "egress")
 
 	case "rule_add":
 		if err := b.Manager.AddRule(text); err != nil {
-			b.render(ctx, v, errBox("添加失败", err), backTo("rules"))
+			b.askRuleAdd(ctx, v, err.Error())
 			return
 		}
 		b.showRules(ctx, v)
 
 	case "ad_allow":
 		if err := b.Manager.AllowAd(text); err != nil {
-			b.render(ctx, v, errBox("添加失败", err), backTo("adblock"))
+			b.askFor(ctx, v, action, esc(err.Error()))
 			return
 		}
-		b.showAdBlock(ctx, v)
+		b.showAdAllowlist(ctx, v)
 
 	case "update_interval":
-		hours, err := strconv.Atoi(strings.TrimSpace(text))
+		hours, err := strconv.Atoi(text)
+		if err == nil {
+			err = b.Manager.SetUpdateInterval(hours)
+		}
 		if err != nil {
-			b.render(ctx, v, errBox("输入无效", fmt.Errorf("请输入 1-168 的整数")), backTo("update"))
+			b.askFor(ctx, v, action, "请输入 1-168 的整数")
 			return
 		}
-		if err := b.Manager.SetUpdateInterval(hours); err != nil {
-			b.render(ctx, v, errBox("设置失败", err), backTo("update"))
-			return
-		}
-		b.showUpdate(ctx, v)
+		b.showUpdateSettings(ctx, v)
 
-	case "monitor_after":
-		n, err := strconv.Atoi(strings.TrimSpace(text))
+	case "monitor_after", "monitor_cooldown":
+		n, err := strconv.Atoi(text)
+		if err == nil {
+			if action == "monitor_after" {
+				err = b.Manager.SetMonitorAlerts(n, 0, nil)
+			} else {
+				err = b.Manager.SetMonitorAlerts(0, n, nil)
+			}
+		}
 		if err != nil {
-			b.render(ctx, v, errBox("输入无效", fmt.Errorf("请输入 1-60 的整数")), backTo("monitor_settings"))
-			return
-		}
-		if err := b.Manager.SetMonitorAlerts(n, 0, nil); err != nil {
-			b.render(ctx, v, errBox("设置失败", err), backTo("monitor_settings"))
-			return
-		}
-		b.showMonitorSettings(ctx, v)
-
-	case "monitor_cooldown":
-		n, err := strconv.Atoi(strings.TrimSpace(text))
-		if err != nil {
-			b.render(ctx, v, errBox("输入无效", fmt.Errorf("请输入 1-1440 的整数")), backTo("monitor_settings"))
-			return
-		}
-		if err := b.Manager.SetMonitorAlerts(0, n, nil); err != nil {
-			b.render(ctx, v, errBox("设置失败", err), backTo("monitor_settings"))
+			b.askFor(ctx, v, action, "请输入范围内的整数")
 			return
 		}
 		b.showMonitorSettings(ctx, v)
 
 	case "probe":
-		target := strings.TrimSpace(text)
-		b.render(ctx, v, "🩺 正在诊断 <code>"+html.EscapeString(target)+"</code> …", "")
-		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		tr := b.Manager.Probe(cctx, target)
-
-		verdict := "✅ 连通正常"
-		if !tr.OK() {
-			verdict = "❌ 存在故障"
-		}
-		body := fmt.Sprintf("🩺 <b>诊断结果</b> · %s\n<code>%s</code>\n\n<pre>%s</pre>",
-			verdict, html.EscapeString(target), html.EscapeString(tr.Human()))
-		b.render(ctx, v, body, inlineKeyboard(
-			[]btn{{"🔁 再测一次", "ask_probe"}},
-			[]btn{btnHome()},
-		))
+		b.doProbe(ctx, v, text)
 	}
 }
 
-// ---------- 视图 ----------
+// ---------- 文件 ----------
 
-func (b *Bot) showMenu(ctx context.Context, v view) {
-	st := b.Manager.Status(b.Version)
-
-	cur := "本机直出"
-	for _, e := range st.Egress {
-		if e.Current {
-			cur = e.Name
-			break
-		}
-	}
-
-	live := "🟢"
-	if !st.DomesticReady {
-		live = "🟡"
-	}
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "%s  <b>5gpn-NEXT</b>\n", em("🤖"))
-	var info strings.Builder
-	fmt.Fprintf(&info, "%s 运行　<b>%s</b> · <code>%s</code>\n", live, st.Uptime, html.EscapeString(st.Version))
-	fmt.Fprintf(&info, "%s 出口　<b>%s</b>\n", em("🌏"), html.EscapeString(cur))
-	fmt.Fprintf(&info, "%s 规则　<b>%d</b>", em("🧭"), st.Rules)
-	if !st.DomesticReady {
-		info.WriteString("\n⚠️ 国内规则未就绪，已回落本机直出")
-	}
-	sb.WriteString(card(info.String()))
-
-	newTag := b.Manager.UpdateBanner()
-	if newTag != "" {
-		fmt.Fprintf(&sb, "\n\n%s  <b>%s</b> 可更新", em("🚀"), html.EscapeString(newTag))
-	}
-
-	rows := [][]btn{}
-	if newTag != "" {
-		rows = append(rows, []btn{{"🚀 升级到 " + newTag, "update_apply:" + newTag}})
-	}
-	rows = append(rows,
-		[]btn{{"📡 运行总览", "status"}},
-		[]btn{{"🌏 出口", "egress"}, {"🧭 规则", "rules"}},
-		[]btn{{"🛡 广告", "adblock"}, {"🩺 诊断", "ask_probe"}},
-		[]btn{{"📱 接入", "client"}, {"♻️ 更新", "update"}},
-	)
-	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
-}
-
-func (b *Bot) showStatus(ctx context.Context, v view) {
-	st := b.Manager.Status(b.Version)
-
-	var sb strings.Builder
-	sb.WriteString(pageHead("📊", "运行总览"))
-	var info strings.Builder
-	fmt.Fprintf(&info, "版本　<code>%s</code>\n", html.EscapeString(st.Version))
-	fmt.Fprintf(&info, "运行　<b>%s</b>\n", st.Uptime)
-	fmt.Fprintf(&info, "监听　<code>%s</code>\n", html.EscapeString(st.Listen))
-	fmt.Fprintf(&info, "内存　<b>%.1f MB</b>", st.MemoryMB)
-	if st.CertUntil != "" {
-		fmt.Fprintf(&info, "\n证书　%s", html.EscapeString(st.CertUntil))
-	}
-	if st.DomesticReady {
-		info.WriteString("\n国内　直连规则已就绪")
-	} else {
-		info.WriteString("\n国内　⚠️ 规则未就绪，已回落本机直出")
-	}
-	sb.WriteString(card(info.String()))
-
-	if sum, ok := b.Manager.TrafficSummary(); ok {
-		fmt.Fprintf(&sb, "\n%s  <b>今日转发</b>\n", em("🔥"))
-		fmt.Fprintf(&sb, "%s\n", card(fmt.Sprintf("↑ %s　↓ %s　·　%s",
-			stats.HumanBytes(sum.Today.Up), stats.HumanBytes(sum.Today.Down),
-			stats.HumanBytes(sum.Today.Total()))))
-	}
-
-	if h, ok := b.Manager.HealthReport(); ok && len(h.Egress) > 0 {
-		var lines strings.Builder
-		for i, e := range h.Egress {
-			if i > 0 {
-				lines.WriteString("\n")
-			}
-			icon := rateIcon(e.Probe1h.FailRate())
-			if e.Probe1h.Count == 0 && e.Fw1h.Count > 0 {
-				icon = rateIcon(e.Fw1h.FailRate())
-			}
-			avg := "—"
-			if e.Probe1h.Count > 0 {
-				avg = e.Probe1h.Avg()
-			}
-			fmt.Fprintf(&lines, "%s <b>%s</b>　%s", icon, html.EscapeString(e.Name), avg)
-		}
-		sb.WriteString("\n<b>出口</b>\n")
-		sb.WriteString(card(lines.String()))
-	}
-
-	if len(st.Counters) > 0 {
-		var lines strings.Builder
-		first := true
-		for _, k := range []string{"connect", "blocked", "dial_fail", "auth_fail", "v6_fastfail"} {
-			if val, ok := st.Counters[k]; ok {
-				if !first {
-					lines.WriteString("\n")
-				}
-				first = false
-				fmt.Fprintf(&lines, "%s　<b>%d</b>", counterName(k), val)
-			}
-		}
-		if lines.Len() > 0 {
-			sb.WriteString("\n<b>连接</b>\n")
-			sb.WriteString(card(lines.String()))
-		}
-	}
-
-	b.render(ctx, v, sb.String(), inlineKeyboard(
-		[]btn{{"📈 流量", "traffic"}, {"💓 健康", "health"}},
-		[]btn{{"🔄 刷新", "status"}},
-		[]btn{btnHome()},
-	))
-}
-
-func (b *Bot) showTraffic(ctx context.Context, v view) {
-	sum, ok := b.Manager.TrafficSummary()
-	if !ok {
-		b.render(ctx, v, "📈 <b>网关转发流量</b>\n\n统计功能未启用。", backTo("menu"))
-		return
-	}
-
-	var sb strings.Builder
-	sb.WriteString(pageHead("🔥", "转发流量"))
-	sb.WriteString("<i>这里只统计经过 5gpn-NEXT 服务器的数据，不是手机总流量。</i>\n\n")
-	row := func(icon, name string, d stats.Day) {
-		fmt.Fprintf(&sb, "%s <b>%s</b>　<b>%s</b>\n", icon, name, stats.HumanBytes(d.Total()))
-		fmt.Fprintf(&sb, "<blockquote>↑ %s　↓ %s\n%d 连接 · 网关直出 %d / 代理出口 %d",
-			stats.HumanBytes(d.Up), stats.HumanBytes(d.Down),
-			d.Conns, d.DirectConns, d.ProxyConns)
-		if d.Blocked > 0 {
-			fmt.Fprintf(&sb, " / 拦截 %d", d.Blocked)
-		}
-		// v0.13.9 及更早版本把 QUIC/失败写成未识别 action；历史聚合
-		// 无法可靠反推直连或代理，只透明展示差额，不伪造分类。
-		unclassified := d.Conns - d.DirectConns - d.ProxyConns - d.Blocked
-		if unclassified > 0 {
-			fmt.Fprintf(&sb, " / 旧版未分类 %d", unclassified)
-		}
-		if d.Failed > 0 {
-			fmt.Fprintf(&sb, "\n其中失败 %d", d.Failed)
-		}
-		sb.WriteString("</blockquote>\n")
-	}
-	row("📅", "今日", sum.Today)
-	row("🗓", "近 7 天", sum.Days7)
-	row("📆", "近 30 天", sum.Days30)
-
-	if len(sum.TopDomain) > 0 {
-		sb.WriteString("\n🔝 <b>网关累计流量最高的站点</b>\n<blockquote expandable>")
-		for i, t := range sum.TopDomain {
-			if i >= 8 {
-				break
-			}
-			if i > 0 {
-				sb.WriteString("\n")
-			}
-			fmt.Fprintf(&sb, "%d. <code>%s</code> · %s", i+1,
-				html.EscapeString(truncateText(t.Host, 30)), stats.HumanBytes(t.Bytes))
-		}
-		sb.WriteString("</blockquote>")
-	}
-	fmt.Fprintf(&sb, "\n<i>按北京时间自然日统计；国内网站等手机本地直连流量不在其中。统计自 %s 起，流量统计本身仅保留聚合数据。</i>",
-		html.EscapeString(sum.Since))
-
-	b.render(ctx, v, sb.String(), inlineKeyboard(
-		[]btn{{"🔄 刷新", "traffic"}},
-		[]btn{btnHome()},
-	))
-}
-
-func (b *Bot) showEgress(ctx context.Context, v view) {
-	st := b.Manager.Status(b.Version)
-	h, hasHealth := b.Manager.HealthReport()
-	probe := map[string]string{}
-	if hasHealth {
-		for _, e := range h.Egress {
-			if e.Probe1h.Count == 0 {
-				continue
-			}
-			probe[e.Name] = fmt.Sprintf("%s %s", rateIcon(e.Probe1h.FailRate()), e.Probe1h.Avg())
-		}
-	}
-
-	var sb strings.Builder
-	sb.WriteString(pageHead("🌏", "出口"))
-	if !st.DomesticReady {
-		sb.WriteString("⚠️ <b>国内直连规则尚未就绪</b>\n<blockquote>为防止退化成全局代理，当前已回落本机直出；切换代理出口时会先刷新国内规则。</blockquote>\n\n")
-	}
-
-	var rows [][]btn
-	for _, e := range st.Egress {
-		mark := "○"
-		if e.Current {
-			mark = "●"
-		}
-		disp := e.Display
-		if disp == "" {
-			disp = e.Name
-		}
-		line := fmt.Sprintf("%s <b>%s</b> · <i>%s</i>", mark, html.EscapeString(disp), e.Type)
-		if p, ok := probe[e.Name]; ok {
-			line += " · " + p
-		}
-		sb.WriteString(line + "\n")
-
-		rows = append(rows, []btn{{mark + " " + truncateText(disp, 16), "egress_info:" + e.Name}})
-	}
-	sb.WriteString("\n<i>● 为当前国外兜底出口。点节点名进入管理。</i>")
-
-	rows = append(rows, []btn{{"➕ 添加出口", "ask_egress_add"}})
-	rows = append(rows, []btn{btnHome()})
-	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
-}
-
-// showEgressInfo 是单出口详情页：状态、地址、探测统计与全部操作。
-func (b *Bot) showEgressInfo(ctx context.Context, v view, name string) {
-	st := b.Manager.Status(b.Version)
-	var eg *manage.EgressStatus
-	for i := range st.Egress {
-		if st.Egress[i].Name == name {
-			eg = &st.Egress[i]
-			break
-		}
-	}
-	if eg == nil {
-		b.showEgress(ctx, v)
-		return
-	}
-	disp := eg.Display
-	if disp == "" {
-		disp = eg.Name
-	}
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "%s <b>%s</b>\n", em("🌏"), html.EscapeString(disp))
-	if eg.Current {
-		sb.WriteString("● <b>当前国外兜底出口</b>\n")
-	}
-	fmt.Fprintf(&sb, "协议　<i>%s</i>\n", html.EscapeString(eg.Type))
-	if eg.Server != "" {
-		fmt.Fprintf(&sb, "服务器　<code>%s</code>\n", html.EscapeString(eg.Server))
-	}
-	v6 := "✗"
-	if eg.HasIPv6 {
-		v6 = "✓"
-	}
-	fmt.Fprintf(&sb, "IPv6 代拨　<b>%s</b>\n", v6)
-
-	if h, ok := b.Manager.HealthReport(); ok {
-		for _, e := range h.Egress {
-			if e.Name != name {
-				continue
-			}
-			if e.Probe1h.Count > 0 {
-				fmt.Fprintf(&sb, "\n<b>近 1 小时</b>\n<blockquote>%s %s 均 <b>%s</b> · p95 <b>%s</b> · 失败 <b>%d</b>/%d",
-					rateIcon(e.Probe1h.FailRate()), e.Kind.Label(), e.Probe1h.Avg(), e.Probe1h.P95(), e.Probe1h.Fail, e.Probe1h.Count)
-				if e.Fw1h.Count > 0 {
-					fmt.Fprintf(&sb, "\n转发 <b>%d</b> 次 · 均 <b>%s</b> · 失败 <b>%d</b>", e.Fw1h.Count, e.Fw1h.Avg(), e.Fw1h.Fail)
-				}
-				if e.UpBytes > 0 || e.DownBytes > 0 {
-					fmt.Fprintf(&sb, "\n流量 ↑ <b>%s</b> · ↓ <b>%s</b>", humanBytes(e.UpBytes), humanBytes(e.DownBytes))
-				}
-				sb.WriteString("</blockquote>")
-			}
-			break
-		}
-	}
-
-	var rows [][]btn
-	if !eg.Current {
-		rows = append(rows, []btn{{"🌏 设为国外兜底出口", "switch:" + eg.Name}})
-	}
-	row := []btn{{"🧪 测试连通", "test_egress:" + eg.Name}}
-	if eg.Name != "DIRECT" {
-		row = append(row, btn{"✏️ 改名", "rename_egress:" + eg.Name})
-	}
-	rows = append(rows, row)
-	if eg.Name != "DIRECT" {
-		rows = append(rows, []btn{{"🗑 删除此出口", "del_egress_ask:" + eg.Name}})
-	}
-	rows = append(rows, []btn{{"« 返回出口列表", "egress"}})
-	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
-}
-
-// doTestEgress 端到端测试出口连通性。
-func (b *Bot) doTestEgress(ctx context.Context, v view, name string) {
-	b.render(ctx, v, "🧪 正在测试出口 <code>"+html.EscapeString(name)+"</code> …\n\n<i>经该出口真实访问外网并校验响应。</i>", "")
-	d, err := b.Manager.TestEgress(name)
-	if err != nil {
-		b.render(ctx, v, fmt.Sprintf(
-			"❌ <b>出口不通</b> · <code>%s</code>\n\n<code>%s</code>",
-			html.EscapeString(name), html.EscapeString(err.Error())),
-			inlineKeyboard(
-				[]btn{{"🔁 再测一次", "test_egress:" + name}},
-				[]btn{{"« 返回节点", "egress_info:" + name}},
-			))
-		return
-	}
-	b.render(ctx, v, fmt.Sprintf(
-		"✅ <b>出口连通</b> · <code>%s</code>\n\n端到端耗时 <b>%dms</b>",
-		html.EscapeString(name), d.Milliseconds()),
-		inlineKeyboard(
-			[]btn{{"🔁 再测一次", "test_egress:" + name}},
-			[]btn{{"« 返回节点", "egress_info:" + name}},
-		))
-}
-
-// showAdBlock 展示广告拦截状态与开关。
-func (b *Bot) showAdBlock(ctx context.Context, v view) {
-	st := b.Manager.Status(b.Version)
-	ad := st.AdBlock
-
-	var sb strings.Builder
-	sb.WriteString(pageHead("💪", "广告拦截"))
-	var info strings.Builder
-	if ad.Enabled {
-		if ad.Domains > 0 {
-			fmt.Fprintf(&info, "状态　<b>开启</b> · <b>%d</b> 条规则", ad.Domains)
-		} else {
-			info.WriteString("状态　<b>开启</b>\n⚠️ 规则尚未载入")
-		}
-	} else {
-		info.WriteString("状态　<b>关闭</b>")
-	}
-	fmt.Fprintf(&info, "\n今日　<b>%d</b>　·　累计　<b>%d</b>", ad.Hits.Today, ad.Hits.Total)
-	if ad.Allowlist > 0 {
-		fmt.Fprintf(&info, "\n白名单　<b>%d</b> 条", ad.Allowlist)
-	}
-	sb.WriteString(card(info.String()))
-
-	rows := [][]btn{}
-	if n := len(ad.Hits.Recent); n > 0 {
-		if n > 5 {
-			n = 5
-		}
-		sb.WriteString("\n<b>最近拦截</b>　<i>点域名即可放行</i>\n<blockquote>")
-		for i := 0; i < n; i++ {
-			ev := ad.Hits.Recent[i]
-			if i > 0 {
-				sb.WriteString("\n")
-			}
-			fmt.Fprintf(&sb, "<code>%s</code> · %s", html.EscapeString(ev.Host), time.Unix(ev.At, 0).Format("15:04"))
-			rows = append(rows, []btn{{
-				"➕ " + truncateText(ev.Host, 22),
-				"ad_allow_hit:" + ruleFingerprint(ev.Host),
-			}})
-		}
-		sb.WriteString("</blockquote>")
-	} else if ad.Enabled {
-		sb.WriteString("\n<i>还没有成功拦截记录。</i>")
-	}
-	sb.WriteString("\n<i>只拦系统 DNS。App 自带 DoH 或直连 IP 拦不到。</i>")
-
-	if ad.Enabled {
-		rows = append(rows, []btn{{"🔴 关闭", "adblock_off"}, {"🔄 刷新规则", "adblock_on"}})
-	} else {
-		rows = append(rows, []btn{{"🟢 开启拦截", "adblock_on"}})
-	}
-	rows = append(rows,
-		[]btn{{"📋 白名单", "ad_allow_list"}, {"✏️ 手动添加", "ask_ad_allow"}},
-		[]btn{btnHome()},
-	)
-	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
-}
-
-func (b *Bot) doAdBlockToggle(ctx context.Context, v view, on bool) {
-	if on {
-		b.render(ctx, v, "🛡 正在更新广告规则…\n\n<i>首次需下载规则集，大约十几秒。</i>", "")
-	}
-	cctx, cancel := context.WithTimeout(ctx, 150*time.Second)
-	_, err := b.Manager.SetAdBlock(cctx, on)
-	cancel()
-	if err != nil {
-		b.render(ctx, v, errBox("操作失败", err), backTo("adblock"))
-		return
-	}
-	b.showAdBlock(ctx, v)
-}
-
-func (b *Bot) doAdAllowHit(ctx context.Context, v view, fp string) {
-	st := b.Manager.Status(b.Version)
-	host := ""
-	for _, ev := range st.AdBlock.Hits.Recent {
-		if ruleFingerprint(ev.Host) == fp {
-			host = ev.Host
-			break
-		}
-	}
-	if host == "" {
-		b.render(ctx, v, "这条拦截记录已经翻过去了，请重新打开广告页再选。", backTo("adblock"))
-		return
-	}
-	if err := b.Manager.AllowAd(host); err != nil {
-		b.render(ctx, v, errBox("加入白名单失败", err), backTo("adblock"))
-		return
-	}
-	b.showAdBlock(ctx, v)
-}
-
-func (b *Bot) showAdAllowlist(ctx context.Context, v view) {
-	list := b.Manager.AdAllowlist()
-
-	var sb strings.Builder
-	sb.WriteString(pageHead("📋", "广告白名单"))
-	if len(list) == 0 {
-		sb.WriteString("<blockquote>暂无白名单。\n某个 App 被误杀时，把它的域名加进来即可放行。</blockquote>")
-	} else {
-		sb.WriteString("<blockquote>")
-		for i, d := range list {
-			if i > 0 {
-				sb.WriteString("\n")
-			}
-			fmt.Fprintf(&sb, "%d. <code>%s</code>", i+1, html.EscapeString(d))
-		}
-		sb.WriteString("</blockquote>")
-	}
-
-	rows := [][]btn{}
-	for i, d := range list {
-		if i >= 10 {
-			break
-		}
-		rows = append(rows, []btn{{"🗑 " + truncateText(d, 24), fmt.Sprintf("ad_allow_del:%d", i)}})
-	}
-	rows = append(rows,
-		[]btn{{"➕ 加白名单", "ask_ad_allow"}},
-		[]btn{{"« 返回广告拦截", "adblock"}},
-	)
-	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
-}
-
-func (b *Bot) showRules(ctx context.Context, v view) {
-	rules := b.Manager.Rules()
-
-	var sb strings.Builder
-	sb.WriteString(pageHead("🧭", "分流规则"))
-	sb.WriteString("<i>先匹配自定义，再走内置国内直连与默认出口。</i>\n\n")
-
-	sb.WriteString("✏️ <b>自定义规则</b>\n")
-	if len(rules) == 0 {
-		sb.WriteString("<blockquote>暂无。国内直连、国外走出口已由内置规则完成，\n通常只在个别域名需要特殊处理时才添加。</blockquote>\n")
-	} else {
-		sb.WriteString("<blockquote>")
-		for i, r := range rules {
-			if i >= 20 {
-				fmt.Fprintf(&sb, "\n… 另有 %d 条未显示", len(rules)-20)
-				break
-			}
-			if i > 0 {
-				sb.WriteString("\n")
-			}
-			fmt.Fprintf(&sb, "%d. <code>%s</code>", i+1, html.EscapeString(r))
-		}
-		sb.WriteString("</blockquote>\n")
-	}
-
-	sb.WriteString("\n🔒 <b>内置规则</b>　<i>不可修改</i>\n")
-	sb.WriteString("<blockquote expandable>优先于自定义（私网保护 + DoH 绕过阻断）：\n")
-	for _, r := range config.BuiltinPre() {
-		fmt.Fprintf(&sb, "<code>%s</code>\n", html.EscapeString(r))
-	}
-	for _, r := range config.BuiltinDoHBlock() {
-		fmt.Fprintf(&sb, "<code>%s</code>\n", html.EscapeString(r))
-	}
-	sb.WriteString("\n自定义之后（Google 下载修复，跟随默认国外出口）：\n")
-	for _, r := range config.BuiltinGoogleFix() {
-		fmt.Fprintf(&sb, "<code>%s</code>\n", html.EscapeString(r))
-	}
-	sb.WriteString("\n最后兜底（国内直连）：\n")
-	for i, r := range config.BuiltinPost() {
-		if i > 0 {
-			sb.WriteString("\n")
-		}
-		fmt.Fprintf(&sb, "<code>%s</code>", html.EscapeString(r))
-	}
-	sb.WriteString("</blockquote>")
-
-	var rows [][]btn
-	rows = append(rows, []btn{{"📱 应用分流", "apps"}})
-	rows = append(rows, []btn{{"➕ 添加规则", "ask_rule_add"}})
-	if len(rules) > 0 {
-		rows = append(rows, []btn{{"🗑 删除规则", "rule_del_menu"}})
-	}
-	rows = append(rows, []btn{btnHome()})
-	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
-}
-
-// askRuleAdd 提示添加规则，动态列出可用出口名，支持分流到不同出口。
-func (b *Bot) askRuleAdd(ctx context.Context, v view) {
-	var sb strings.Builder
-	sb.WriteString("➕ <b>添加分流规则</b>\n\n")
-	sb.WriteString("格式：<code>类型,值,动作</code>\n\n")
-	sb.WriteString("<b>动作</b>：<code>direct</code>（本机直出）· ")
-	sb.WriteString("<code>block</code>（拦截）· <code>proxy:出口名</code>\n\n")
-
-	names := b.Manager.SortedEgressNames()
-	var proxies []string
-	for _, n := range names {
-		if n != "DIRECT" {
-			proxies = append(proxies, n)
-		}
-	}
-	if len(proxies) > 0 {
-		sb.WriteString("<b>可用出口</b>：")
-		for i, n := range proxies {
-			if i > 0 {
-				sb.WriteString(" · ")
-			}
-			fmt.Fprintf(&sb, "<code>%s</code>", html.EscapeString(n))
-		}
-		sb.WriteString("\n\n")
-		fmt.Fprintf(&sb, "示例：\n<code>DOMAIN-SUFFIX,openai.com,proxy:%s</code>\n", html.EscapeString(proxies[0]))
-	} else {
-		sb.WriteString("示例：\n<code>DOMAIN-SUFFIX,openai.com,proxy:出口名</code>\n")
-	}
-	sb.WriteString("<code>DOMAIN-SUFFIX,example.cn,direct</code>\n")
-	sb.WriteString("<code>DOMAIN-KEYWORD,ads,block</code>\n\n")
-	sb.WriteString("新规则会插入到最前面，优先匹配；不同域名可分流到不同出口。")
-
-	b.ask(ctx, v, "rule_add", sb.String(), "rules")
-}
-
-// showRuleDelMenu 列出可删除的自定义规则，每条一个按钮，按钮上带规则内容。
-func (b *Bot) showRuleDelMenu(ctx context.Context, v view) {
-	rules := b.Manager.Rules()
-	if len(rules) == 0 {
-		b.showRules(ctx, v)
-		return
-	}
-
-	var sb strings.Builder
-	sb.WriteString(pageHead("💬", "删除规则"))
-	sb.WriteString("<i>点击要删除的规则，删除前会再确认一次。</i>\n\n<blockquote>")
-	for i, r := range rules {
-		if i >= 12 {
-			fmt.Fprintf(&sb, "\n… 另有 %d 条，请在内网面板中操作", len(rules)-12)
-			break
-		}
-		if i > 0 {
-			sb.WriteString("\n")
-		}
-		fmt.Fprintf(&sb, "%d. <code>%s</code>", i+1, html.EscapeString(r))
-	}
-	sb.WriteString("</blockquote>")
-
-	var rows [][]btn
-	for i, r := range rules {
-		if i >= 12 {
-			break
-		}
-		rows = append(rows, []btn{{fmt.Sprintf("🗑 %d · %s", i+1, truncateText(ruleGist(r), 24)),
-			fmt.Sprintf("rule_del_ask:%d", i)}})
-	}
-	rows = append(rows, []btn{{"« 返回规则", "rules"}})
-	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
-}
-
-// askRuleDelete 删除前确认，展示完整规则内容。
-func (b *Bot) askRuleDelete(ctx context.Context, v view, idx int) {
-	rules := b.Manager.Rules()
-	if idx < 0 || idx >= len(rules) {
-		b.showRules(ctx, v)
-		return
-	}
-	body := fmt.Sprintf("⚠️ <b>确认删除这条规则？</b>\n\n<code>%s</code>\n\n<i>删除后立即生效。</i>",
-		html.EscapeString(rules[idx]))
-	b.render(ctx, v, body, inlineKeyboard(
-		[]btn{{"🗑 确认删除", fmt.Sprintf("rule_del_do:%d:%s", idx, ruleFingerprint(rules[idx]))}},
-		[]btn{{"« 取消", "rule_del_menu"}},
-	))
-}
-
-// doRuleDelete 校验指纹后删除：规则列表在确认期间可能已变化，
-// 指纹不匹配时拒绝，避免误删错位后的其它规则。
-func (b *Bot) doRuleDelete(ctx context.Context, v view, arg string) {
-	parts := strings.SplitN(arg, ":", 2)
-	idx, err := strconv.Atoi(parts[0])
-	if err != nil {
-		b.showRules(ctx, v)
-		return
-	}
-	rules := b.Manager.Rules()
-	if idx < 0 || idx >= len(rules) ||
-		len(parts) < 2 || ruleFingerprint(rules[idx]) != parts[1] {
-		b.render(ctx, v, "⚠️ <b>规则列表已变化</b>\n\n为避免误删，本次操作已取消，请重新选择。",
-			backTo("rules"))
-		return
-	}
-	if err := b.Manager.RemoveRule(idx); err != nil {
-		b.render(ctx, v, errBox("删除失败", err), backTo("rules"))
-		return
-	}
-	b.showRules(ctx, v)
-}
-
-// ruleGist 取规则中最有辨识度的部分（值），供按钮标签使用。
-func ruleGist(r string) string {
-	parts := strings.Split(r, ",")
-	if len(parts) >= 2 {
-		return strings.TrimSpace(parts[1])
-	}
-	return r
-}
-
-// ruleFingerprint 生成规则内容短指纹，用于确认删除时校验列表未变化。
-func ruleFingerprint(r string) string {
-	sum := sha256.Sum256([]byte(r))
-	return hex.EncodeToString(sum[:4])
-}
-
-func (b *Bot) showClient(ctx context.Context, v view) {
-	var sb strings.Builder
-	sb.WriteString(pageHead("📱", "接入"))
-	sb.WriteString("<b>iPhone / iPad</b>\n")
-	sb.WriteString(card("安装描述文件，仅蜂窝数据生效；连 Wi-Fi 自动停用。国内流量手机直连，国外才走出口。") + "\n")
-	sb.WriteString("<b>Android</b>\n")
-	sb.WriteString(card("系统「私人 DNS」填入网关域名即可，不用装 App。"))
-	if b.PanelURL != "" {
-		sb.WriteString("\n<b>内网面板</b>\n")
-		sb.WriteString(card("<code>" + html.EscapeString(b.PanelURL) + "</code>\n手机走内网卡直接打开，无需登录。"))
-	}
-
-	rows := [][]btn{}
-	if b.Manager.DNSProfileBytes != nil {
-		rows = append(rows, []btn{{"🍎 获取 iOS 描述文件", "ios_dns_profile"}})
-	}
-	rows = append(rows, []btn{{"🤖 Android 接入", "android_guide"}})
-	if b.PanelURL != "" {
-		rows = append(rows, []btn{{"🖥 打开面板", "url:" + b.PanelURL}})
-	}
-	rows = append(rows, []btn{btnHome()})
-	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
-}
-
-func (b *Bot) showPanel(ctx context.Context, v view) {
-	var sb strings.Builder
-	sb.WriteString(pageHead("💻", "内网面板") + "\n")
-
-	if b.PanelURL == "" {
-		sb.WriteString("面板未启用。\n\n")
-		sb.WriteString("如需开启：编辑 <code>/etc/5gpn-next/config.json</code>，\n")
-		sb.WriteString("把 <code>panel.enabled</code> 设为 <code>true</code>，\n")
-		sb.WriteString("然后执行 <code>systemctl restart 5gpn-next</code>。")
-		b.render(ctx, v, sb.String(), backTo("menu"))
-		return
-	}
-
-	sb.WriteString("在浏览器中管理出口、分流与诊断：\n\n")
-	fmt.Fprintf(&sb, "<code>%s</code>\n\n", html.EscapeString(b.PanelURL))
-	sb.WriteString("📱 手机连着内网卡时<b>直接打开即可</b>，无需登录。\n")
-	sb.WriteString("🔒 仅内网卡来源可访问，公网完全无法连接。")
-
-	b.render(ctx, v, sb.String(), inlineKeyboard(
-		[]btn{{"🖥 打开面板", "url:" + b.PanelURL}},
-		[]btn{btnHome()},
-	))
-}
-
-func (b *Bot) showAndroid(ctx context.Context, v view) {
-	var g manage.AndroidGuide
-	if b.Manager.AndroidInfo != nil {
-		g = b.Manager.AndroidInfo()
-	}
-
-	var sb strings.Builder
-	sb.WriteString(pageHead("🤖", "Android 接入"))
-
-	if !g.Enabled {
-		sb.WriteString("当前未启用 Android 支持。\n\n")
-		sb.WriteString("开启方法：编辑 <code>/etc/5gpn-next/config.json</code>，\n")
-		sb.WriteString("把 <code>dns.enabled</code> 设为 <code>true</code>，\n")
-		sb.WriteString("然后执行 <code>systemctl restart 5gpn-next</code>。")
-		b.render(ctx, v, sb.String(), backTo("client"))
-		return
-	}
-
-	sb.WriteString("在手机上依次打开：\n\n")
-	sb.WriteString("<b>设置 → 网络和互联网 → 私人 DNS</b>\n\n")
-	sb.WriteString("选择「指定的私人 DNS 服务提供商主机名」，填入：\n\n")
-	fmt.Fprintf(&sb, "<code>%s</code>\n\n", html.EscapeString(g.DoTHost))
-	sb.WriteString("✅ 保存后立即生效，无需安装任何应用。\n\n")
-	if g.Note != "" {
-		fmt.Fprintf(&sb, "<i>%s</i>", html.EscapeString(g.Note))
-	}
-
-	b.render(ctx, v, sb.String(), inlineKeyboard(
-		[]btn{{"« 返回客户端", "client"}},
-		[]btn{btnHome()},
-	))
-}
-
-// ---------- 更新 ----------
-
-func (b *Bot) showUpdate(ctx context.Context, v view) {
-	checkOn, autoApply, interval := b.Manager.UpdateSettings()
-	ignored := b.Manager.IgnoredVersions()
-	rel, checkedAt, hasCache := b.Manager.CachedUpdate()
-
-	var sb strings.Builder
-	sb.WriteString(pageHead("🚀", "版本更新"))
-	fmt.Fprintf(&sb, "🏷 当前版本　<code>%s</code>\n", html.EscapeString(b.Version))
-	if checkOn {
-		fmt.Fprintf(&sb, "🔁 自动检查　<b>开</b> · 每 %d 小时\n", interval)
-	} else {
-		sb.WriteString("🔁 自动检查　<b>关</b>\n")
-	}
-	fmt.Fprintf(&sb, "🤖 自动安装　<b>%s</b>\n", onOff(autoApply))
-	if len(ignored) > 0 {
-		fmt.Fprintf(&sb, "🔕 已忽略　<code>%s</code>\n", html.EscapeString(strings.Join(ignored, ", ")))
-	}
-
-	// 最近一次检查结果（缓存，不打网络）。
-	var newTag string
-	sb.WriteString("\n")
-	if hasCache && rel != nil {
-		if b.Manager.UpdateBanner() != "" {
-			newTag = rel.Tag
-			fmt.Fprintf(&sb, "🟢 <b>有新版本 %s</b>\n", html.EscapeString(rel.Tag))
-			if !rel.Published.IsZero() {
-				fmt.Fprintf(&sb, "📅 发布　%s\n", rel.Published.Format("2006-01-02 15:04"))
-			}
-			if notes := truncateText(strings.TrimSpace(rel.Notes), 800); notes != "" {
-				fmt.Fprintf(&sb, "\n📋 <b>更新内容</b>\n<blockquote expandable>%s</blockquote>\n", html.EscapeString(notes))
-			}
-		} else if b.Manager.IsIgnoredVersion(rel.Tag) && rel.Tag != b.Version {
-			fmt.Fprintf(&sb, "🔕 最新 <code>%s</code> 已被忽略\n", html.EscapeString(rel.Tag))
-		} else {
-			sb.WriteString("✅ 已是最新版本\n")
-		}
-		fmt.Fprintf(&sb, "<i>上次检查 %s</i>\n", checkedAt.Local().Format("01-02 15:04"))
-	} else {
-		sb.WriteString("<i>尚未检查过，点「立即检查」拉取最新版本信息。</i>\n")
-	}
-	sb.WriteString("\n<i>升级会校验哈希后替换程序并重启；启动失败自动回退。</i>")
-
-	var rows [][]btn
-	if newTag != "" {
-		rows = append(rows, []btn{{"🚀 立即更新到 " + newTag, "update_apply:" + newTag}})
-		rows = append(rows, []btn{{"🔕 忽略 " + newTag, "update_ignore:" + newTag}})
-	}
-	rows = append(rows, []btn{{"🔄 立即检查", "update_check"}, {autoApplyLabel(autoApply), "update_toggle_auto"}})
-	rows = append(rows, []btn{{fmt.Sprintf("⏱ 检查间隔：%d 小时", interval), "ask_update_interval"}})
-	rows = append(rows, []btn{{"🗂 备份列表", "update_backups"}, {"📋 升级历史", "update_history"}})
-	if len(ignored) > 0 {
-		rows = append(rows, []btn{{fmt.Sprintf("🧹 清空忽略（%d）", len(ignored)), "update_clear_ignored"}})
-	}
-	if len(b.Manager.RollbackVersions()) > 0 {
-		rows = append(rows, []btn{{"⏪ 回退到旧版本", "update_rollback"}})
-	}
-	rows = append(rows, []btn{btnHome()})
-	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
-}
-
-func onOff(v bool) string {
-	if v {
-		return "开"
-	}
-	return "关"
-}
-
-func autoApplyLabel(on bool) string {
-	if on {
-		return "🤖 自动安装：开"
-	}
-	return "🚦 自动安装：关"
-}
-
-func (b *Bot) doUpdateCheck(ctx context.Context, v view) {
-	b.render(ctx, v, "🔍 正在查询最新版本 …", "")
-
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	has, rel, err := b.Manager.CheckUpdate(cctx)
-	if err != nil {
-		b.render(ctx, v, errBox("查询失败", err), backTo("update"))
-		return
-	}
-	if !has {
-		b.render(ctx, v, fmt.Sprintf(
-			"✅ <b>已是最新版本</b>\n\n当前 <code>%s</code>", html.EscapeString(b.Version)),
-			backTo("update"))
-		return
-	}
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "🆕 <b>发现新版本 %s</b>\n", html.EscapeString(rel.Tag))
-	fmt.Fprintf(&sb, "🏷 当前　<code>%s</code>\n", html.EscapeString(b.Version))
-	if !rel.Published.IsZero() {
-		fmt.Fprintf(&sb, "📅 发布　%s\n", rel.Published.Format("2006-01-02 15:04"))
-	}
-	if notes := truncateText(strings.TrimSpace(rel.Notes), 1000); notes != "" {
-		fmt.Fprintf(&sb, "\n📋 <b>更新内容</b>\n<blockquote expandable>%s</blockquote>", html.EscapeString(notes))
-	}
-
-	b.render(ctx, v, sb.String(), inlineKeyboard(
-		[]btn{{"🚀 立即升级到 " + rel.Tag, "update_apply:" + rel.Tag}},
-		[]btn{{"« 返回", "update"}},
-	))
-}
-
-// updateStages 是升级阶段的展示顺序与文案。
-var updateStages = []struct{ key, label string }{
-	{"download", "⬇️ 下载新版本"},
-	{"verify", "🔎 校验哈希"},
-	{"backup", "📦 备份当前版本"},
-	{"restart", "🔄 重启生效"},
-}
-
-// renderUpdateProgress 渲染升级进度清单：已完成 ✅、进行中 ⏳、未开始 ○。
-func renderUpdateProgress(tag, current string) string {
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "%s <b>正在升级到 %s</b>\n", em("🚀"), html.EscapeString(tag))
-	reached := true
-	for _, st := range updateStages {
-		switch {
-		case st.key == current:
-			fmt.Fprintf(&sb, "⏳ %s <b>← 进行中</b>\n", st.label)
-			reached = false
-		case reached:
-			fmt.Fprintf(&sb, "✅ %s\n", st.label)
-		default:
-			fmt.Fprintf(&sb, "○ %s\n", st.label)
-		}
-	}
-	sb.WriteString("\n<i>重启后由独立事务健康检查，失败自动回退。</i>")
-	return sb.String()
-}
-
-func (b *Bot) doUpdateApply(ctx context.Context, v view, tag string) {
-	b.render(ctx, v, renderUpdateProgress(tag, "download"), "")
-
-	// 阶段回调：每步就地编辑同一条消息。回调来自升级 goroutine，
-	// 用独立短超时 context，绝不阻塞升级本身。
-	// lastStage 去重：初始渲染已是 download，首个回调不必重复编辑。
-	lastStage := "download"
-	b.Manager.SetUpdateStageHook(func(stage, _ string) {
-		if stage == lastStage {
-			return
-		}
-		lastStage = stage
-		sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
-		b.render(sctx, v, renderUpdateProgress(tag, stage), "")
-		scancel()
-	})
-	defer b.Manager.SetUpdateStageHook(nil)
-
-	// 升级会重启本进程，用独立 context 避免被取消
-	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	_, err := b.Manager.ApplyUpdate(cctx, tag)
-	if err != nil {
-		b.render(ctx, v, errBox("升级失败", err), backTo("update"))
-		return
-	}
-	// 全部准备阶段完成：同一条消息收尾为「重启生效中」。重启后新进程
-	// 会继续编辑这条消息写入最终结果——整个升级链路只占一条消息。
-	id := b.render(ctx, v, renderUpdateProgress(tag, "restart"), "")
-	if id != 0 {
-		updatepkg.SaveNotifyTarget(v.chatID, id)
-	}
-}
-
-// EditMessage 编辑指定消息（供升级结果等跨进程场景使用）。
-func (b *Bot) EditMessage(ctx context.Context, chatID, msgID int64, text, keyboard string) {
-	b.render(ctx, view{chatID: chatID, msgID: msgID}, text, keyboard)
-}
-
-func (b *Bot) showRollback(ctx context.Context, v view) {
-	vs := b.Manager.RollbackVersions()
-	if len(vs) == 0 {
-		b.render(ctx, v, "⏪ <b>回退版本</b>\n\n没有可用的版本备份。", backTo("update"))
-		return
-	}
-	var rows [][]btn
-	for i, ver := range vs {
-		if i >= 6 {
-			break
-		}
-		rows = append(rows, []btn{{"⏪ 回退到 " + ver, "rollback:" + ver}})
-	}
-	rows = append(rows, []btn{{"« 返回", "update"}})
-	b.render(ctx, v,
-		"⏪ <b>回退版本</b>\n\n<i>回退后会自动重启并验证服务状态。</i>",
-		inlineKeyboard(rows...))
-}
-
-func (b *Bot) doRollback(ctx context.Context, v view, tag string) {
-	b.render(ctx, v, "⏪ 正在回退到 <code>"+html.EscapeString(tag)+"</code> …", "")
-	cctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	msg, err := b.Manager.Rollback(cctx, tag)
-	if err != nil {
-		b.render(ctx, v, errBox("回退失败", err), backTo("update"))
-		return
-	}
-	b.render(ctx, v, "✅ <b>回退任务已启动</b>\n\n"+html.EscapeString(msg), backTo("menu"))
-}
-
-// ---------- 描述文件 ----------
-
-// sendDNSProfile 下发「蜂窝 DNS 模式」描述文件。
-func (b *Bot) sendDNSProfile(ctx context.Context, v view) {
-	if b.Manager.DNSProfileBytes == nil {
-		b.render(ctx, v, "<b>获取失败</b>\n\n蜂窝 DNS 模式需要启用 dns.enabled（DoT 入口）。", backTo("client"))
-		return
-	}
-	data, err := b.Manager.DNSProfileBytes()
-	if err != nil {
-		b.render(ctx, v, errBox("生成失败", err), backTo("client"))
-		return
-	}
-
-	profileURL := b.Manager.ProfileDownloadURL()
-	sentQR := false
-	if profileURL != "" {
-		if png, qerr := qrcode.EncodePNG(profileURL); qerr != nil {
-			log.Printf("Bot 生成描述文件二维码失败: %v", qerr)
-		} else {
-			qrCaption := "<b>iOS 蜂窝 DNS 描述文件</b>\n\n" +
-				"<b>方式一：扫码安装</b>\n" +
-				"1. 如已安装旧版 5gpn 描述文件，请先删除\n" +
-				"2. 手机走<b>内网卡蜂窝数据</b>，用相机或 Safari 扫码\n" +
-				"3. 打开 设置 → 通用 → VPN 与设备管理并安装\n\n" +
-				"<b>方式二：点击下方文件下载</b>\n\n" +
-				"链接：<code>" + html.EscapeString(profileURL) + "</code>\n\n" +
-				"<i>✅ 仅蜂窝数据生效，Wi-Fi 完全不受影响；国内 IP 手机本地直连。\n" +
-				"⚠️ 链接含随机串，请勿外传；仅内网卡来源可访问。</i>"
-			if err := b.sendPhoto(ctx, v.chatID, "5gpn-next-dns.png", png, qrCaption); err != nil {
-				log.Printf("Bot 发送描述文件二维码失败: %v", err)
-			} else {
-				sentQR = true
-			}
-		}
-	}
-
-	docCaption := "<b>iOS 蜂窝 DNS 描述文件</b>\n\n" +
-		"1. 如已安装旧版 5gpn 描述文件，请先删除\n" +
-		"2. 点击上方文件并选择下载\n" +
-		"3. 打开 设置 → 通用 → VPN 与设备管理并安装\n\n" +
-		"<i>✅ 仅蜂窝数据生效，Wi-Fi 完全不受影响；国内 IP 手机本地直连。\n" +
-		"⚠️ 加密 DNS 无法识别少数无 SNI 私有协议，这是当前方案的明确边界。</i>"
-	if sentQR {
-		docCaption = "<b>描述文件</b>\n\n也可直接点开这个文件下载安装。"
-	}
-
-	if err := b.sendDocument(ctx, v.chatID, "5gpn-next-dns.mobileconfig", data, docCaption); err != nil {
-		b.render(ctx, v, errBox("发送失败", err), backTo("client"))
-		return
-	}
-	done := "<b>客户端接入</b>\n\n蜂窝 DNS 描述文件已发送，请查看上方文件。"
-	if sentQR {
-		done = "<b>客户端接入</b>\n\n二维码与描述文件都已发送。\n扫码或点开文件都可以安装。"
-	}
-	b.render(ctx, v, done,
-		inlineKeyboard(
-			[]btn{{"重新获取", "ios_dns_profile"}},
-			[]btn{btnHome()},
-		))
-}
-
-func (b *Bot) sendDocument(ctx context.Context, chatID int64, filename string, data []byte, caption string) error {
+// sendFile 上传文件或图片，返回消息 ID。
+func (b *Bot) sendFile(ctx context.Context, method, field string, chatID int64, filename string, data []byte, caption string) (int64, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	_ = mw.WriteField("chat_id", strconv.FormatInt(chatID, 10))
 	_ = mw.WriteField("caption", caption)
 	_ = mw.WriteField("parse_mode", "HTML")
-	fw, err := mw.CreateFormFile("document", filename)
+	fw, err := mw.CreateFormFile(field, filename)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := fw.Write(data); err != nil {
-		return err
+		return 0, err
 	}
 	if err := mw.Close(); err != nil {
-		return err
+		return 0, err
 	}
 
-	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", b.Token)
+	endpoint := fmt.Sprintf("%s/bot%s/%s", b.apiBase, b.Token, method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &buf)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var r struct {
 		OK          bool   `json:"ok"`
 		Description string `json:"description"`
+		Result      struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"result"`
 	}
 	_ = json.Unmarshal(body, &r)
 	if !r.OK {
-		return fmt.Errorf("telegram: %s", r.Description)
+		return 0, fmt.Errorf("telegram: %s", r.Description)
 	}
-	return nil
-}
-
-func (b *Bot) sendPhoto(ctx context.Context, chatID int64, filename string, data []byte, caption string) error {
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	_ = mw.WriteField("chat_id", strconv.FormatInt(chatID, 10))
-	_ = mw.WriteField("caption", caption)
-	_ = mw.WriteField("parse_mode", "HTML")
-	fw, err := mw.CreateFormFile("photo", filename)
-	if err != nil {
-		return err
-	}
-	if _, err := fw.Write(data); err != nil {
-		return err
-	}
-	if err := mw.Close(); err != nil {
-		return err
-	}
-
-	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendPhoto", b.Token)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &buf)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	resp, err := b.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	var r struct {
-		OK          bool   `json:"ok"`
-		Description string `json:"description"`
-	}
-	_ = json.Unmarshal(body, &r)
-	if !r.OK {
-		return fmt.Errorf("telegram: %s", r.Description)
-	}
-	return nil
-}
-
-// ---------- 键盘与排版 ----------
-
-type btn struct {
-	Text string
-	Data string
-}
-
-// inlineKeyboard 渲染 inline 键盘。
-//
-// Data 以 "url:" 开头时渲染为链接按钮，其余为回调按钮。
-func inlineKeyboard(rows ...[]btn) string {
-	type ib struct {
-		Text string `json:"text"`
-		Data string `json:"callback_data,omitempty"`
-		URL  string `json:"url,omitempty"`
-		Icon string `json:"icon_custom_emoji_id,omitempty"` // 字段名须与 buttonIconField 一致
-	}
-	out := make([][]ib, 0, len(rows))
-	for _, r := range rows {
-		row := make([]ib, 0, len(r))
-		for _, e := range r {
-			if strings.HasPrefix(e.Data, "url:") {
-				row = append(row, ib{Text: e.Text, URL: strings.TrimPrefix(e.Data, "url:")})
-				continue
-			}
-			row = append(row, ib{Text: e.Text, Data: e.Data, Icon: buttonIcon(e.Data)})
-		}
-		out = append(out, row)
-	}
-	kb, _ := json.Marshal(map[string]any{"inline_keyboard": out})
-	return string(kb)
-}
-
-func backTo(target string) string {
-	if target == "menu" || target == "" {
-		return inlineKeyboard([]btn{btnHome()})
-	}
-	return inlineKeyboard([]btn{btnBack(target), btnHome()})
-}
-
-func errBox(title string, err error) string {
-	return fmt.Sprintf("<b>%s</b>\n\n<code>%s</code>",
-		html.EscapeString(title), html.EscapeString(err.Error()))
-}
-
-// pad 按显示宽度右侧补空格，中日韩字符按两格计算。
-func pad(s string, width int) string {
-	w := 0
-	for _, r := range s {
-		if r > 0x2E80 {
-			w += 2
-		} else {
-			w++
-		}
-	}
-	if w >= width {
-		return s
-	}
-	return s + strings.Repeat(" ", width-w)
-}
-
-func truncateText(s string, n int) string {
-	s = strings.TrimSpace(s)
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n]) + "…"
-}
-
-func counterName(k string) string {
-	switch k {
-	case "connect":
-		return "连接总数"
-	case "blocked":
-		return "已拦截"
-	case "dial_fail":
-		return "拨号失败"
-	case "auth_fail":
-		return "鉴权失败"
-	case "v6_fastfail":
-		return "IPv6 回落"
-	}
-	return k
-}
-
-// showUpdateBackups 展示可回退版本详情（学 Parrot 的备份列表）。
-func (b *Bot) showUpdateBackups(ctx context.Context, v view) {
-	backups := b.Manager.UpdateBackups()
-
-	var sb strings.Builder
-	sb.WriteString(pageHead("♻️", "本地备份"))
-	if len(backups) == 0 {
-		sb.WriteString("暂无备份。首次升级时会自动保留当前版本。\n")
-	} else {
-		sb.WriteString("<i>升级时自动保留的历史二进制，可随时回退：</i>\n<blockquote>")
-		for i, bk := range backups {
-			if i > 0 {
-				sb.WriteString("\n")
-			}
-			fmt.Fprintf(&sb, "💾 <code>%s</code>　%.1f MB", html.EscapeString(bk.Tag), bk.SizeMB)
-			if !bk.ModTime.IsZero() {
-				fmt.Fprintf(&sb, "　%s", bk.ModTime.Local().Format("01-02 15:04"))
-			}
-		}
-		sb.WriteString("</blockquote>\n")
-	}
-
-	rows := [][]btn{}
-	if len(backups) > 0 {
-		rows = append(rows, []btn{{"⏪ 回退到旧版本", "update_rollback"}})
-	}
-	rows = append(rows, []btn{{"« 返回版本更新", "update"}})
-	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
-}
-
-// showUpdateHistory 展示历次升级结果（学 Parrot 的更新日志）。
-func (b *Bot) showUpdateHistory(ctx context.Context, v view) {
-	hist := b.Manager.UpdateHistory(10)
-
-	var sb strings.Builder
-	sb.WriteString(pageHead("📊", "升级历史"))
-	if len(hist) == 0 {
-		sb.WriteString("暂无记录。升级完成后（无论成败）都会在这里留档。\n")
-	} else {
-		sb.WriteString("<blockquote>")
-		for i, r := range hist {
-			if i > 0 {
-				sb.WriteString("\n")
-			}
-			icon := "❓"
-			label := r.Status
-			switch r.Status {
-			case "success":
-				icon, label = "✅", "成功"
-			case "rolled_back":
-				icon, label = "↩️", "已回退"
-			case "install_failed":
-				icon, label = "❌", "安装失败"
-			case "rollback_failed":
-				icon, label = "🆘", "回退失败"
-			}
-			fmt.Fprintf(&sb, "%s %s → %s　%s　%s",
-				icon,
-				html.EscapeString(r.From), html.EscapeString(r.To),
-				label,
-				time.Unix(r.At, 0).Local().Format("01-02 15:04"))
-		}
-		sb.WriteString("</blockquote>\n")
-	}
-
-	b.render(ctx, v, sb.String(), inlineKeyboard(
-		[]btn{{"« 返回版本更新", "update"}},
-	))
-}
-
-// doEgressAdd 执行添加出口并渲染结果（引导式两步流程的收口）。
-func (b *Bot) doEgressAdd(ctx context.Context, v view, name, link string) {
-	if link == "" || !strings.Contains(link, "://") {
-		b.render(ctx, v, errBox("链接无效", fmt.Errorf("请粘贴完整的节点分享链接")), backTo("egress"))
-		return
-	}
-	b.render(ctx, v, "⏳ 正在添加出口并验证联通性 …\n\n<i>会真实建立一条出站连接，最长约 12 秒。</i>", "")
-	msg, err := b.Manager.AddEgress(name, link)
-	if err != nil {
-		b.render(ctx, v, errBox("添加失败", err), backTo("egress"))
-		return
-	}
-	b.render(ctx, v, fmt.Sprintf("%s <b>已添加出口</b>\n\n%s", em("✅"), html.EscapeString(msg)),
-		inlineKeyboard([]btn{{"🌐 查看出口", "egress"}}, []btn{btnHome()}))
+	return r.Result.MessageID, nil
 }

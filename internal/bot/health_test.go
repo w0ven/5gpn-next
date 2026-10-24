@@ -13,7 +13,7 @@ import (
 var telegramTags = map[string]bool{
 	"b": true, "strong": true, "i": true, "em": true, "u": true, "ins": true,
 	"s": true, "strike": true, "del": true, "span": true, "tg-spoiler": true,
-	"a": true, "code": true, "pre": true, "blockquote": true,
+	"a": true, "code": true, "pre": true, "blockquote": true, "tg-emoji": true,
 }
 
 // assertTelegramHTML 校验文本能被 Telegram 的 HTML parse_mode 接受。
@@ -134,16 +134,6 @@ func TestCertHealthLine(t *testing.T) {
 	}
 }
 
-func TestAppButtonsCarryLogoIcon(t *testing.T) {
-	kb := inlineKeyboard([]btn{{"YouTube", "app:youtube"}, {"规则", "rules"}, {"未知", "app:nope"}})
-	if !strings.Contains(kb, `"callback_data":"app:youtube","icon_custom_emoji_id":"5818947960364342679"`) {
-		t.Errorf("YouTube 按钮缺少 Logo 图标: %s", kb)
-	}
-	if strings.Count(kb, "icon_custom_emoji_id") != 1 {
-		t.Errorf("只有已知应用按钮应带图标: %s", kb)
-	}
-}
-
 func TestAppCheckCardIsValidTelegramHTML(t *testing.T) {
 	out := checkCard([]manage.AppDomain{
 		{Host: "i.ytimg.com", Egresses: map[string]int{"nuross": 2}, Count: 2, Rule: "FINAL → 代理:<nuross>"},
@@ -152,18 +142,5 @@ func TestAppCheckCardIsValidTelegramHTML(t *testing.T) {
 	assertTelegramHTML(t, out)
 	if !strings.Contains(out, "🇭🇰CTC×9") || !strings.Contains(out, "✗ <code>i.ytimg.com</code>") {
 		t.Errorf("核对卡片内容不符合预期: %s", out)
-	}
-}
-
-func TestStripButtonIconsKeepsButtons(t *testing.T) {
-	kb := inlineKeyboard([]btn{{"YouTube", "app:youtube"}, {"Google", "app:google"}}, []btn{btnHome()})
-	out := stripButtonIcons(kb)
-	if strings.Contains(out, buttonIconField) {
-		t.Fatalf("图标未去除: %s", out)
-	}
-	for _, want := range []string{`"callback_data":"app:youtube"`, `"callback_data":"app:google"`, `"text":"« 主菜单"`} {
-		if !strings.Contains(out, want) {
-			t.Errorf("去图标后丢了按钮 %s: %s", want, out)
-		}
 	}
 }
