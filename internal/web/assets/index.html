@@ -120,6 +120,11 @@
       <div><span>白名单</span><strong id="ad-allow-count">—</strong><small>条</small></div>
     </div>
 
+    <div class="ad-trend-row">
+      <div class="ad-trend" id="ad-trend" role="img" aria-label="近 7 天拦截次数"></div>
+      <p class="ad-meta" id="ad-meta"></p>
+    </div>
+
     <div class="record-grid">
       <div class="record-column">
         <div class="subhead"><h3>最近命中</h3><span>最多保留 100 条</span></div>
@@ -129,6 +134,16 @@
         <div class="subhead"><h3>高频域名</h3><span>按成功次数排序</span></div>
         <div id="ad-top" class="hit-list"><p class="empty">暂无统计</p></div>
       </div>
+    </div>
+
+    <div class="extra-editor">
+      <div class="subhead"><h3>附加列表</h3><span>按自己的设备勾选；主规则 anti-AD 始终生效，列表每天自动更新</span></div>
+      <div id="ad-extras" class="extra-grid"></div>
+    </div>
+
+    <div class="suspect-editor">
+      <div class="subhead"><h3>疑似漏网</h3><span>最近 24 小时像广告或上报、却没被拦的域名；拦截会加入自定义规则，可随时删除</span></div>
+      <div id="ad-suspects" class="hit-list"><p class="empty">加载中…</p></div>
     </div>
 
     <div class="allow-editor">

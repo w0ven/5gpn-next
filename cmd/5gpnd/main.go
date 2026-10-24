@@ -666,6 +666,7 @@ func cmdRun(args []string) error {
 				if action == "block" && !config.IsBuiltinDoHBlocked(qname) {
 					traffic.AdBlockSuccess(qname)
 				}
+				mgr.RecordDNS(qname, action)
 			},
 		}
 		go func() {

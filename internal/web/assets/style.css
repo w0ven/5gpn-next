@@ -485,6 +485,66 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   background: linear-gradient(90deg, #11a56f, var(--accent));
 }
 
+.ad-trend-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 18px;
+  margin: -8px 0 22px;
+}
+.ad-trend {
+  flex: 0 0 auto;
+  height: 64px;
+  display: grid;
+  grid-template-columns: repeat(7, 22px);
+  gap: 6px;
+  align-items: end;
+}
+.trend-col { height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 4px; }
+.trend-bar {
+  display: block;
+  width: 100%;
+  min-height: 2px;
+  border-radius: 4px 4px 2px 2px;
+  background: linear-gradient(180deg, #11a56f, var(--accent));
+}
+.trend-day { color: var(--ink-3); font: 10px/1 var(--mono); }
+.ad-meta { margin: 0 0 14px; color: var(--ink-3); font-size: 12.5px; }
+
+.extra-editor, .suspect-editor { margin-top: 24px; }
+.extra-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+  padding-top: 10px;
+}
+.extra-item {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+  padding: 12px 14px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+  font: inherit;
+  color: var(--ink);
+  transition: border-color .15s ease, background .15s ease;
+}
+.extra-item:hover { border-color: var(--accent-line); }
+.extra-item.on { background: var(--accent-soft); border-color: var(--accent-line); }
+.extra-item:disabled { opacity: .6; cursor: default; }
+.extra-head { display: flex; align-items: center; gap: 8px; }
+.extra-head strong { font-size: 13.5px; }
+.extra-head small { margin-left: auto; color: var(--accent-hover); font: 600 11.5px/1 var(--mono); }
+.extra-dot { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid var(--ink-3); flex: 0 0 auto; }
+.extra-item.on .extra-dot { background: var(--accent); border-color: var(--accent); }
+.extra-desc { color: var(--ink-3); font-size: 12px; line-height: 1.45; }
+.extra-warn { color: #b54708; font-size: 11.5px; line-height: 1.45; }
+.suspect-editor .hit-list { min-height: 0; padding-top: 6px; }
+.suspect-editor .hit-main { flex-wrap: wrap; column-gap: 10px; }
+
 .allow-editor { margin-top: 24px; }
 .allow-list {
   display: flex;

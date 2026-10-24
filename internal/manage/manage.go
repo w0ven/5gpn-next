@@ -72,6 +72,7 @@ type Manager struct {
 	FetchRuleSet func(ctx context.Context, name, url string) error
 
 	started time.Time
+	dns     dnsLog
 }
 
 // ProfileDownloadURL 返回当前蜂窝 DNS 描述文件的 HTTPS 下载地址。
@@ -141,6 +142,10 @@ type AdBlockStatus struct {
 	// Allowlist 是白名单条数；AllowDomains 供内网面板管理具体条目。
 	Allowlist    int      `json:"allowlist"`
 	AllowDomains []string `json:"allow_domains,omitempty"`
+	// Extras 是全部附加列表及其开关状态。
+	Extras []AdBlockExtraStatus `json:"extras"`
+	// UpdatedAt 是主规则最后一次内容变化的时间（Unix 秒），0 表示未知。
+	UpdatedAt int64 `json:"updated_at,omitempty"`
 	// Hits 只统计已成功写回客户端的 NXDOMAIN，并保留最近命中记录。
 	Hits stats.AdBlockSummary `json:"hits"`
 }
@@ -167,6 +172,7 @@ func (m *Manager) Status(version string) Status {
 	cfg.Egress = append([]config.EgressConfig(nil), m.Cfg.Egress...)
 	cfg.AdBlock.Allowlist = append([]string(nil), m.Cfg.AdBlock.Allowlist...)
 	eng := m.Policy
+	extras := m.adBlockExtrasLocked()
 	m.mu.RUnlock()
 
 	// 以运行态 FINAL 为准：国内规则未就绪时引擎会安全回落 DIRECT，
@@ -209,6 +215,8 @@ func (m *Manager) Status(version string) Status {
 			Domains:      eng.DomainSetLen(config.AdBlockRuleSetName),
 			Allowlist:    len(cfg.AdBlock.Allowlist),
 			AllowDomains: append([]string(nil), cfg.AdBlock.Allowlist...),
+			Extras:       extras,
+			UpdatedAt:    ruleSetUpdated(config.AdBlockRuleSetName),
 		},
 	}
 	if m.Traffic != nil {
@@ -650,7 +658,7 @@ func (m *Manager) ensureDomesticRules(ctx context.Context) error {
 	m.mu.RUnlock()
 
 	required := map[string]bool{"cn-domain": false, "geoip:cn": false}
-	fetcher := ruleset.NewFetcher("/var/lib/5gpn-next/rulesets")
+	fetcher := ruleset.NewFetcher(ruleSetDir)
 	for _, rs := range sets {
 		if _, ok := required[rs.Name]; !ok {
 			continue
@@ -726,7 +734,7 @@ func (m *Manager) SetAdBlock(ctx context.Context, on bool) (string, error) {
 			return "", fmt.Errorf("本地广告规则集 %s 不可用（已开启，但暂未生效）", rs.Path)
 		}
 	} else {
-		f := ruleset.NewFetcher("/var/lib/5gpn-next/rulesets")
+		f := ruleset.NewFetcher(ruleSetDir)
 		if _, err := f.Fetch(ctx, rs.Name, rs.URL); err != nil {
 			return "", fmt.Errorf("规则集下载失败（已开启，但暂未生效）: %w", err)
 		}

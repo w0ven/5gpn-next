@@ -344,15 +344,20 @@ func (p *Panel) apiHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Panel) apiAdBlock(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, map[string]any{"suspects": p.Manager.AdSuspects(30)})
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "方法不支持"})
 		return
 	}
 	var body struct {
-		Action  string `json:"action"` // toggle | allow | remove_allow
+		Action  string `json:"action"` // toggle | allow | remove_allow | extra | block
 		Enabled bool   `json:"enabled"`
 		Domain  string `json:"domain"`
 		Index   int    `json:"index"`
+		Key     string `json:"key"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
@@ -376,6 +381,10 @@ func (p *Panel) apiAdBlock(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			msg = "白名单已更新"
 		}
+	case "extra":
+		msg, err = p.Manager.SetAdBlockExtra(body.Key, body.Enabled)
+	case "block":
+		msg, err = p.Manager.BlockDomain(body.Domain)
 	default:
 		err = fmt.Errorf("未知操作")
 	}

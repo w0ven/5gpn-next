@@ -328,3 +328,39 @@ func TestAppsAPIAndLogos(t *testing.T) {
 		t.Errorf("设置本机直出失败: %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestAdBlockSuspectsExtrasAndBlock(t *testing.T) {
+	panel, mgr := testPanel(t)
+	h := panel.Handler()
+	mgr.RecordDNS("analytics.example.net", "direct")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/adblock", nil))
+	var got struct {
+		Suspects []manage.AdSuspect `json:"suspects"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || len(got.Suspects) != 1 || got.Suspects[0].Host != "analytics.example.net" {
+		t.Fatalf("GET /api/adblock = %d %s", rec.Code, rec.Body.String())
+	}
+
+	post := func(body string) (int, string) {
+		req := httptest.NewRequest(http.MethodPost, "/api/adblock", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+	if code, body := post(`{"action":"block","domain":"analytics.example.net"}`); code != http.StatusOK {
+		t.Fatalf("block = %d %s", code, body)
+	}
+	if rules := mgr.Rules(); len(rules) == 0 || rules[0] != "DOMAIN-SUFFIX,analytics.example.net,block" {
+		t.Fatalf("应加入拦截规则: %v", rules)
+	}
+	code, body := post(`{"action":"extra","key":"apple","enabled":true}`)
+	if code != http.StatusOK || !strings.Contains(body, `"key":"apple"`) {
+		t.Fatalf("extra = %d %s", code, body)
+	}
+	if code, _ := post(`{"action":"extra","key":"nope","enabled":true}`); code != http.StatusBadRequest {
+		t.Fatalf("未知附加列表应返回 400，实际 %d", code)
+	}
+}

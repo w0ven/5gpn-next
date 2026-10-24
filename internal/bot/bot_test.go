@@ -260,7 +260,7 @@ func TestScreensAreWellFormed(t *testing.T) {
 		"egress", "egress_info:DIRECT", "del_egress_ask:DIRECT", "ask_egress_add",
 		"rules", "rules_builtin", "ask_rule_add", "rule_del_menu",
 		"apps", "app:youtube", "app:claude",
-		"adblock", "ad_allow_list", "ask_ad_allow",
+		"adblock", "ad_allow_list", "ask_ad_allow", "ad_extras", "ad_suspects",
 		"probe", "client", "update", "update_settings", "update_history",
 		"ask_update_interval", "ask_monitor_after", "rename_egress:DIRECT",
 	} {
@@ -347,5 +347,55 @@ func TestAppCheckScreen(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("核对页缺少 %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestAdSuspectBlockAndExtraToggle(t *testing.T) {
+	b, tg, mgr := newTestBot(t)
+	ctx := context.Background()
+	b.screens[admin] = 50
+	for i := 0; i < 4; i++ {
+		mgr.RecordDNS("log19-normal-alisg.tiktokv.com", "proxy")
+	}
+
+	b.handle(ctx, press(50, "adblock"))
+	var text string
+	for _, c := range tg.take() {
+		if c.method == "editMessageText" {
+			text = c.p.Get("text")
+		}
+	}
+	if !strings.Contains(text, "<b>1</b> 个疑似漏网") {
+		t.Fatalf("拦截页应提示疑似漏网: %s", text)
+	}
+
+	b.handle(ctx, press(50, "ad_block_host:"+ruleFingerprint("log19-normal-alisg.tiktokv.com")))
+	tg.take()
+	if rules := mgr.Rules(); len(rules) == 0 || rules[0] != "DOMAIN-SUFFIX,log19-normal-alisg.tiktokv.com,block" {
+		t.Fatalf("应加入拦截规则: %v", rules)
+	}
+
+	b.handle(ctx, press(50, "ad_extra:apple"))
+	var kb string
+	for _, c := range tg.take() {
+		if c.method == "editMessageText" {
+			kb = c.p.Get("reply_markup")
+		}
+	}
+	if len(mgr.Cfg.AdBlock.Extras) != 1 || mgr.Cfg.AdBlock.Extras[0] != "apple" {
+		t.Fatalf("应开启苹果附加列表: %v", mgr.Cfg.AdBlock.Extras)
+	}
+	if !strings.Contains(kb, `"text":"● 苹果","callback_data":"ad_extra:apple","style":"primary"`) {
+		t.Fatalf("已开启的列表按钮应高亮: %s", kb)
+	}
+}
+
+func TestSparkline(t *testing.T) {
+	if sparkline([]stats.DayCount{{Count: 0}, {Count: 0}}) != "" {
+		t.Fatal("全为 0 时不画")
+	}
+	got := sparkline([]stats.DayCount{{Count: 0}, {Count: 5}, {Count: 10}})
+	if got != "▁▅█" {
+		t.Fatalf("sparkline = %q", got)
 	}
 }
