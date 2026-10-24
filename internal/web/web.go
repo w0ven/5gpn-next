@@ -377,7 +377,7 @@ func (p *Panel) apiAdBlock(w http.ResponseWriter, r *http.Request) {
 			msg = "已加入广告白名单：" + strings.TrimSpace(body.Domain)
 		}
 	case "remove_allow":
-		err = p.Manager.RemoveAdAllow(body.Index)
+		err = p.Manager.RemoveAdAllow(body.Index, body.Domain)
 		if err == nil {
 			msg = "白名单已更新"
 		}
@@ -402,7 +402,8 @@ func (p *Panel) apiRules(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{
-			"rules": p.Manager.Rules(),
+			"rules":    p.Manager.Rules(),
+			"problems": p.Manager.RuleProblems(),
 			// DoH 阻断紧随私网保护，展示顺序与实际编译顺序一致。
 			"builtin_pre": append(config.BuiltinPre(), config.BuiltinDoHBlock()...),
 			// Google 下载修复排在国内直连兜底之前。
@@ -417,11 +418,12 @@ func (p *Panel) apiRules(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
 			return
 		}
-		if err := p.Manager.AddRule(body.Rule); err != nil {
+		msg, err := p.Manager.AddRule(body.Rule)
+		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"rules": p.Manager.Rules()})
+		writeJSON(w, http.StatusOK, map[string]any{"rules": p.Manager.Rules(), "message": msg})
 
 	case http.MethodDelete:
 		idx, err := strconv.Atoi(r.URL.Query().Get("index"))
@@ -429,7 +431,9 @@ func (p *Panel) apiRules(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "序号无效"})
 			return
 		}
-		if err := p.Manager.RemoveRule(idx); err != nil {
+		// 带上页面看到的规则原文：面板打开期间 Bot 可能改过列表，
+		// 只按序号删会删到错位后的另一条。
+		if err := p.Manager.RemoveRule(idx, r.URL.Query().Get("rule")); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}

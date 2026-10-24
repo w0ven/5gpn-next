@@ -386,8 +386,12 @@ func (b *Bot) doEgressAdd(ctx context.Context, v view, name, link string) {
 
 // ---------- 分流 ----------
 
-func (b *Bot) showRules(ctx context.Context, v view) {
+func (b *Bot) showRules(ctx context.Context, v view) { b.showRulesNote(ctx, v, "") }
+
+// showRulesNote 显示分流页；notice 非空时在底部附上刚才操作的结果。
+func (b *Bot) showRulesNote(ctx context.Context, v view, notice string) {
 	rules := b.Manager.Rules()
+	problems := b.Manager.RuleProblems()
 
 	var sb strings.Builder
 	sb.WriteString(head("route", "分流"))
@@ -424,6 +428,9 @@ func (b *Bot) showRules(ctx context.Context, v view) {
 				lines.WriteString("\n")
 			}
 			fmt.Fprintf(&lines, "%d. <code>%s</code>", i+1, esc(r))
+			if p, bad := problems[i]; bad {
+				fmt.Fprintf(&lines, "\n　%s <i>不生效：%s</i>", ic("warn"), esc(p))
+			}
 		}
 		sb.WriteString(card(lines.String()))
 	}
@@ -431,12 +438,59 @@ func (b *Bot) showRules(ctx context.Context, v view) {
 	rows := [][]btn{
 		{{Text: "应用分流", Data: "apps", Icon: "route"}, {Text: "添加规则", Data: "ask_rule_add"}},
 	}
-	second := []btn{{Text: "内置规则", Data: "rules_builtin"}}
+	second := []btn{{Text: "内置规则", Data: "rules_builtin"}, {Text: "规则集状态", Data: "rulesets"}}
 	if len(rules) > 0 {
 		second = append([]btn{{Text: "删除规则", Data: "rule_del_menu"}}, second...)
 	}
 	rows = append(rows, second, navRow("menu"))
+	if notice != "" {
+		sb.WriteString(note("ok", esc(notice)))
+	}
 	b.render(ctx, v, sb.String(), inlineKeyboard(rows...))
+}
+
+// showRuleSets 列出每个规则集的条目数、内容更新时间与最近一次检查结果。
+func (b *Bot) showRuleSets(ctx context.Context, v view) {
+	states := b.Manager.RuleSetStates()
+	var sb strings.Builder
+	sb.WriteString(head("route", "规则集状态"))
+	sb.WriteString("<i>网关按各自的间隔联网检查，失败后每小时重试，连续 3 次失败会推送提醒。</i>\n")
+	failing := 0
+	for _, st := range states {
+		var c strings.Builder
+		fmt.Fprintf(&c, "<b>%s</b>", esc(st.Label))
+		if st.Entries > 0 {
+			fmt.Fprintf(&c, "　%s 条", groupDigits(st.Entries))
+		}
+		c.WriteString("\n")
+		switch {
+		case st.Local:
+			c.WriteString("本地文件，不联网更新")
+		case st.Failing():
+			failing++
+			fmt.Fprintf(&c, "%s 连续 %d 次检查失败（最近 %s）\n<i>%s</i>",
+				ic("warn"), st.Check.Fails, agoShort(st.Check.LastCheck), esc(truncateText(st.Check.LastError, 90)))
+		case st.Check.LastCheck.IsZero():
+			c.WriteString("尚未联网检查")
+		default:
+			fmt.Fprintf(&c, "%s %s检查正常", ic("ok"), agoShort(st.Check.LastCheck))
+		}
+		if !st.Local {
+			if !st.Updated.IsZero() {
+				fmt.Fprintf(&c, "\n内容更新于 %s", agoShort(st.Updated))
+			}
+			if st.IntervalHours < 0 {
+				c.WriteString(" · 不自动更新")
+			} else {
+				fmt.Fprintf(&c, " · 每 %d 小时检查", st.IntervalHours)
+			}
+		}
+		sb.WriteString(card(c.String()))
+	}
+	if failing > 0 {
+		sb.WriteString(note("warn", fmt.Sprintf("%d 个规则集在用旧版本，网络恢复后会自动更新。", failing)))
+	}
+	b.render(ctx, v, sb.String(), backTo("rules"))
 }
 
 func (b *Bot) showBuiltinRules(ctx context.Context, v view) {
@@ -467,7 +521,8 @@ func (b *Bot) askRuleAdd(ctx context.Context, v view, errNote string) {
 	var sb strings.Builder
 	sb.WriteString(head("route", "添加规则"))
 	sb.WriteString("格式　<code>类型,值,动作</code>\n")
-	sb.WriteString("动作　<code>direct</code> 本机直出 · <code>block</code> 拦截 · <code>proxy:出口名</code>\n")
+	sb.WriteString("动作　<code>direct</code> 手机直连（国内）· <code>block</code> 拦截\n")
+	sb.WriteString("　　　<code>proxy</code> 默认出口 · <code>proxy:出口名</code> 指定出口 · <code>proxy:DIRECT</code> 网关本机直出\n")
 	var names []string
 	for _, n := range b.Manager.SortedEgressNames() {
 		if n != "DIRECT" {
@@ -481,7 +536,7 @@ func (b *Bot) askRuleAdd(ctx context.Context, v view, errNote string) {
 	}
 	sb.WriteString(card("<code>DOMAIN-SUFFIX,openai.com,proxy:" + example + "</code>\n" +
 		"<code>DOMAIN-SUFFIX,example.cn,direct</code>\n<code>DOMAIN-KEYWORD,ads,block</code>"))
-	sb.WriteString("\n<i>新规则插在最前面，优先匹配。</i>")
+	sb.WriteString("\n<i>新规则插在最前面，优先匹配。添加后会告诉你它实际让流量走哪里。</i>")
 	b.ask(ctx, v, "rule_add", sb.String(), "rules", esc(errNote))
 }
 
@@ -533,7 +588,7 @@ func (b *Bot) doRuleDelete(ctx context.Context, v view, arg string) {
 		b.showRuleDelMenu(ctx, v)
 		return
 	}
-	if err := b.Manager.RemoveRule(idx); err != nil {
+	if err := b.Manager.RemoveRule(idx, rules[idx]); err != nil {
 		b.fail(ctx, v, "删除失败", err, "rules")
 		return
 	}
@@ -627,7 +682,7 @@ func (b *Bot) showAdAllowlist(ctx context.Context, v view) {
 		if i >= 10 {
 			break
 		}
-		bs = append(bs, btn{Text: "移除 " + truncateText(d, 20), Data: fmt.Sprintf("ad_allow_del:%d", i)})
+		bs = append(bs, btn{Text: "移除 " + truncateText(d, 20), Data: fmt.Sprintf("ad_allow_del:%d:%s", i, ruleFingerprint(d))})
 	}
 	rows := grid(1, bs)
 	rows = append(rows, []btn{{Text: "加入白名单", Data: "ask_ad_allow", Icon: "shield"}}, navRow("adblock"))

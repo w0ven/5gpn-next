@@ -181,7 +181,7 @@ function renderAdBlock(ad) {
       rm.type = 'button';
       rm.title = '移除 ' + domain;
       rm.setAttribute('aria-label', '移除白名单 ' + domain);
-      rm.onclick = () => adBlockAction('remove_allow', { index });
+      rm.onclick = () => adBlockAction('remove_allow', { index, domain });
       chip.appendChild(rm);
       allowBox.appendChild(chip);
     });
@@ -358,18 +358,22 @@ function renderRules(data) {
   if (!rules.length) {
     box.appendChild(el('p', 'empty', '暂无自定义规则。国内直连、国外走出口已由内置策略完成。'));
   }
+  const problems = data.problems || {};
   rules.forEach((rule, index) => {
     const row = el('div', 'row');
     row.appendChild(el('span', 'rule-index', String(index + 1)));
     const main = el('div', 'row-main');
     main.appendChild(el('div', 'rule-text', rule));
+    if (problems[index]) {
+      main.appendChild(el('div', 'rule-problem', '不生效：' + problems[index]));
+    }
     row.appendChild(main);
     const acts = el('div', 'row-actions');
     const rm = el('button', 'btn btn-sm btn-danger', '删除');
     rm.onclick = async () => {
       if (!confirm('确认删除这条规则？\n\n' + rule)) return;
       try {
-        await api('/api/rules?index=' + index, { method: 'DELETE' });
+        await api('/api/rules?index=' + index + '&rule=' + encodeURIComponent(rule), { method: 'DELETE' });
         await loadRules();
         toast('规则已删除');
       } catch (err) {
@@ -634,10 +638,10 @@ $('rule-add').onclick = async () => {
   const rule = $('rule-input').value.trim();
   if (!rule) { toast('请输入规则', true); return; }
   try {
-    await api('/api/rules', { method: 'POST', body: JSON.stringify({ rule }) });
+    const data = await api('/api/rules', { method: 'POST', body: JSON.stringify({ rule }) });
     await loadRules();
     $('rule-input').value = '';
-    toast('规则已添加');
+    toast(data.message || '规则已添加');
   } catch (err) {
     toast(err.message, true);
   }

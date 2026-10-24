@@ -26,7 +26,7 @@ func TestNormalizeTarget(t *testing.T) {
 
 func TestDisplayOfDirectUsesKFCName(t *testing.T) {
 	e := config.EgressConfig{Name: "DIRECT", Type: "direct"}
-	if got, want := displayOf(e), "KFC 本机出口"; got != want {
+	if got, want := displayOf(e), "网关本机出口"; got != want {
 		t.Fatalf("displayOf(DIRECT)=%q, want %q", got, want)
 	}
 }

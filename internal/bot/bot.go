@@ -625,6 +625,8 @@ func (b *Bot) dispatch(ctx context.Context, v view, cmd string) {
 	// 分流
 	case "rules":
 		b.showRules(ctx, v)
+	case "rulesets":
+		b.showRuleSets(ctx, v)
 	case "rules_builtin":
 		b.showBuiltinRules(ctx, v)
 	case "ask_rule_add":
@@ -664,8 +666,15 @@ func (b *Bot) dispatch(ctx context.Context, v view, cmd string) {
 	case "ad_allow_list":
 		b.showAdAllowlist(ctx, v)
 	case "ad_allow_del":
-		idx, _ := strconv.Atoi(arg)
-		if err := b.Manager.RemoveAdAllow(idx); err != nil {
+		idxStr, fp, _ := strings.Cut(arg, ":")
+		idx, _ := strconv.Atoi(idxStr)
+		list := b.Manager.AdAllowlist()
+		if idx < 0 || idx >= len(list) || ruleFingerprint(list[idx]) != fp {
+			b.ack(ctx, v, "白名单已变化，为避免误删已取消，请重新选择", true)
+			b.showAdAllowlist(ctx, v)
+			return
+		}
+		if err := b.Manager.RemoveAdAllow(idx, list[idx]); err != nil {
 			b.fail(ctx, v, "移除失败", err, "ad_allow_list")
 			return
 		}
@@ -802,11 +811,12 @@ func (b *Bot) handleInput(ctx context.Context, v view, action, text string) {
 			"<i>支持 ss · vless · vmess · trojan · hysteria2 · tuic · socks5 · http</i>", "egress")
 
 	case "rule_add":
-		if err := b.Manager.AddRule(text); err != nil {
+		msg, err := b.Manager.AddRule(text)
+		if err != nil {
 			b.askRuleAdd(ctx, v, err.Error())
 			return
 		}
-		b.showRules(ctx, v)
+		b.showRulesNote(ctx, v, msg)
 
 	case "ad_allow":
 		if err := b.Manager.AllowAd(text); err != nil {

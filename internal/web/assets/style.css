@@ -334,6 +334,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   font: 13px/1.6 var(--mono);
   overflow-wrap: anywhere;
 }
+.rule-problem { color: var(--warn); font-size: 12px; margin-top: 2px; }
 .builtin-tag { color: var(--ink-3); font-size: 11.5px; white-space: nowrap; }
 
 .empty { color: var(--ink-3); font-size: 13px; margin: 8px 0; }

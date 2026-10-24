@@ -221,6 +221,10 @@ func applyRules(cfg *config.Config, eng *policy.Engine) error {
 	// 不能因为选了出口就让广告不再被拦。
 	// 内置规则不在配置文件里，Bot/面板改不到也删不掉。
 	finalAct, finalEg := parseAction(cfg.Final)
+	defaultEg := "DIRECT"
+	if finalAct == policy.ActionProxy && finalEg != "" {
+		defaultEg = finalEg
+	}
 	googleFix := config.BuiltinGoogleFix()
 	if finalAct == policy.ActionProxy && finalEg != "" {
 		// 跟随当前默认国外出口；切换出口会触发热重载，这里随之更新。
@@ -246,6 +250,11 @@ func applyRules(cfg *config.Config, eng *policy.Engine) error {
 		kind := policy.RuleKind(strings.ToUpper(strings.TrimSpace(parts[0])))
 		val := strings.TrimSpace(parts[1])
 		act, eg := parseAction(strings.TrimSpace(parts[2]))
+		// 不带出口名的 proxy 跟随默认国外出口；默认是手机直连时由网关
+		// 本机直出。留空会在转发时找不到出口，记一次失败再回退。
+		if act == policy.ActionProxy && eg == "" {
+			eg = defaultEg
+		}
 
 		if err := eng.AddRule(policy.Rule{
 			Kind: kind, Value: val, Action: act, Egress: eg,

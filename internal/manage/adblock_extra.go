@@ -276,7 +276,7 @@ func (m *Manager) BlockDomain(host string) (string, error) {
 		}
 	}
 	m.mu.RUnlock()
-	if err := m.AddRule(rule); err != nil {
+	if _, err := m.AddRule(rule); err != nil {
 		return "", err
 	}
 	return "已拦截 " + host + "（可在自定义规则里删除）", nil

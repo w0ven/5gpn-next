@@ -387,7 +387,7 @@ func displayOf(e config.EgressConfig) string {
 		return e.DisplayName
 	}
 	if e.Name == "DIRECT" && e.Type == "direct" {
-		return "KFC 本机出口"
+		return "网关本机出口"
 	}
 	return e.Name
 }
@@ -842,12 +842,16 @@ func (m *Manager) AdAllowlist() []string {
 	return append([]string(nil), m.Cfg.AdBlock.Allowlist...)
 }
 
-// RemoveAdAllow 按序号移除白名单条目。
-func (m *Manager) RemoveAdAllow(idx int) error {
+// RemoveAdAllow 按序号移除白名单条目；expect 非空时必须与该位置一致，
+// 防止列表被另一端改过后删错。
+func (m *Manager) RemoveAdAllow(idx int, expect string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if idx < 0 || idx >= len(m.Cfg.AdBlock.Allowlist) {
-		return fmt.Errorf("序号 %d 超出范围", idx+1)
+		return fmt.Errorf("白名单已变化，请刷新后重试")
+	}
+	if expect != "" && m.Cfg.AdBlock.Allowlist[idx] != expect {
+		return fmt.Errorf("白名单已变化，为避免误删已取消，请刷新后重试")
 	}
 	m.Cfg.AdBlock.Allowlist = append(m.Cfg.AdBlock.Allowlist[:idx], m.Cfg.AdBlock.Allowlist[idx+1:]...)
 	return m.saveAndReloadLocked()
@@ -862,31 +866,6 @@ func (m *Manager) Rules() []string {
 	out := make([]string, len(m.Cfg.Rules))
 	copy(out, m.Cfg.Rules)
 	return out
-}
-
-// AddRule 追加一条规则。插入到 FINAL 之前、其它规则之后。
-func (m *Manager) AddRule(rule string) error {
-	rule = strings.TrimSpace(rule)
-	parts := strings.Split(rule, ",")
-	if len(parts) < 3 {
-		return fmt.Errorf("格式应为 类型,值,动作，例如 DOMAIN-SUFFIX,openai.com,proxy:node")
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// 新规则插到最前，便于覆盖既有的大规则集
-	m.Cfg.Rules = append([]string{rule}, m.Cfg.Rules...)
-	return m.saveAndReloadLocked()
-}
-
-// RemoveRule 按序号删除规则。
-func (m *Manager) RemoveRule(idx int) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if idx < 0 || idx >= len(m.Cfg.Rules) {
-		return fmt.Errorf("序号超出范围")
-	}
-	m.Cfg.Rules = append(m.Cfg.Rules[:idx], m.Cfg.Rules[idx+1:]...)
-	return m.saveAndReloadLocked()
 }
 
 // ---------- 诊断 ----------
