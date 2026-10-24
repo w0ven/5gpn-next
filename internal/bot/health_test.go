@@ -144,3 +144,17 @@ func TestAppCheckCardIsValidTelegramHTML(t *testing.T) {
 		t.Errorf("核对卡片内容不符合预期: %s", out)
 	}
 }
+
+func TestRouteCardIsValidTelegramHTML(t *testing.T) {
+	out := routeCard([]manage.AppRoute{
+		{Host: "youtubei.googleapis.com", Egress: "att", Rule: "DOMAIN-SUFFIX,googleapis.com"},
+		{Host: "ads.youtube.com", Blocked: true, OK: true},
+		{Host: "*.googlevideo.com", Egress: "ctc", OK: true},
+	}, map[string]string{"att": "🇺🇸ATT"})
+	assertTelegramHTML(t, out)
+	for _, want := range []string{"✗ <code>youtubei.googleapis.com</code>　→ 🇺🇸ATT", "⊘ <code>ads.youtube.com</code>　广告拦截", "✓ <code>*.googlevideo.com</code>"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("缺少 %q: %s", want, out)
+		}
+	}
+}

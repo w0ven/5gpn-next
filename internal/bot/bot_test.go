@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/w0ven/5gpn-next/internal/config"
@@ -316,6 +317,35 @@ func TestRuleExampleUsesFullEgressName(t *testing.T) {
 	for _, c := range tg.take() {
 		if c.method == "editMessageText" && !strings.Contains(c.p.Get("text"), "proxy:ctc</code>") {
 			t.Fatalf("示例中的出口名不完整: %s", c.p.Get("text"))
+		}
+	}
+}
+
+func TestAppCheckScreen(t *testing.T) {
+	b, tg, mgr := newTestBot(t)
+	logPath := filepath.Join(b.state, "trace.jsonl")
+	line := `{"ts":"` + time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano) +
+		`","target":"www.youtube.com:443","steps":[{"stage":"policy","status":"ok","detail":"FINAL → 代理:<nuross>"},{"stage":"egress","status":"ok","detail":"nuross"}]}`
+	if err := os.WriteFile(logPath, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mgr.Cfg.LogPath = logPath
+	mgr.Cfg.Egress = append(mgr.Cfg.Egress, config.EgressConfig{Name: "ctc", Type: "socks5", DisplayName: "🇭🇰CTC"})
+	mgr.Cfg.Apps = map[string]string{"youtube": "ctc"}
+	mgr.Cfg.AppsChanged = map[string]int64{"youtube": time.Now().Add(-10 * time.Minute).Unix()}
+	b.screens[admin] = 50
+
+	b.handle(context.Background(), press(50, "app_check:youtube"))
+	var text string
+	for _, c := range tg.take() {
+		if c.method == "editMessageText" {
+			text = c.p.Get("text")
+		}
+	}
+	assertTelegramHTML(t, text)
+	for _, want := range []string{"按当前规则", "实际连接", "改出口后 10 分钟", "还没有 YouTube 的连接", "<code>www.youtube.com</code>"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("核对页缺少 %q:\n%s", want, text)
 		}
 	}
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/w0ven/5gpn-next/internal/apps"
 	"github.com/w0ven/5gpn-next/internal/config"
+	"github.com/w0ven/5gpn-next/internal/policy"
 )
 
 // AppStatus 描述一个应用的分流设置。
@@ -128,19 +129,17 @@ func (m *Manager) SetAppEgress(key, egressName string) error {
 	if m.Cfg.Apps == nil {
 		m.Cfg.Apps = map[string]string{}
 	}
+	if m.Cfg.AppsChanged == nil {
+		m.Cfg.AppsChanged = map[string]int64{}
+	}
 	if egressName == "" {
 		delete(m.Cfg.Apps, key)
+		delete(m.Cfg.AppsChanged, key)
 	} else {
 		m.Cfg.Apps[key] = egressName
+		m.Cfg.AppsChanged[key] = time.Now().Unix()
 	}
-	if err := m.saveAndReloadLocked(); err != nil {
-		return err
-	}
-	if m.appChanged == nil {
-		m.appChanged = map[string]time.Time{}
-	}
-	m.appChanged[key] = time.Now()
-	return nil
+	return m.saveAndReloadLocked()
 }
 
 // AppDomain 是核对结果中的一个域名。
@@ -155,13 +154,35 @@ type AppDomain struct {
 	Rule string `json:"rule,omitempty"`
 }
 
-// AppCheck 是用真实转发记录核对应用分流的结果。
+// AppRoute 是按当前规则对一个域名的判定。
+type AppRoute struct {
+	Host   string `json:"host"`
+	Egress string `json:"egress,omitempty"`
+	Rule   string `json:"rule"`
+	// Blocked 表示被广告拦截等规则拦下：属预期行为，不算没走选定出口。
+	Blocked bool `json:"blocked,omitempty"`
+	OK      bool `json:"ok"`
+}
+
+// 核对窗口的起点来源。
+const (
+	SinceChanged = "changed" // 改出口的时刻
+	SinceStarted = "started" // 网关启动时刻（变更时间未知时，只能保证此后用的是当前配置）
+	SinceWindow  = "window"  // 固定回看窗口
+)
+
+// AppCheck 是核对应用分流的结果：Current 用当前规则复核最近见过的域名与
+// 内置核心域名，不依赖新流量；Domains 是窗口内真实转发的实际出口。
 type AppCheck struct {
 	Key           string    `json:"key"`
 	Egress        string    `json:"egress"`
 	EgressDisplay string    `json:"egress_display"`
 	Since         time.Time `json:"since"`
-	// Domains 是命中该应用清单的域名。
+	SinceKind     string    `json:"since_kind"`
+	// Current 是按当前规则的判定，异常在前。
+	Current         []AppRoute `json:"current"`
+	CurrentMismatch int        `json:"current_mismatch"`
+	// Domains 是窗口内命中该应用清单的域名。
 	Domains []AppDomain `json:"domains"`
 	// Suspects 是含该应用特征、却没命中任何已启用应用清单，
 	// 也没走选定出口的域名：可能是清单漏掉的。
@@ -186,9 +207,14 @@ func (m *Manager) CheckApp(key string) (AppCheck, error) {
 	want := m.Cfg.Apps[key]
 	logPath := m.Cfg.LogPath
 	eng := m.Policy
-	since := time.Now().Add(-appCheckWindow)
-	if t := m.appChanged[key]; t.After(since) {
-		since = t
+	now := time.Now()
+	since, kind := now.Add(-appCheckWindow), SinceWindow
+	changed, changedKind := m.started, SinceStarted
+	if ts := m.Cfg.AppsChanged[key]; ts > 0 {
+		changed, changedKind = time.Unix(ts, 0), SinceChanged
+	}
+	if changed.After(since) {
+		since, kind = changed, changedKind
 	}
 	enabled := make([]apps.App, 0)
 	for _, x := range apps.MatchOrder() {
@@ -196,7 +222,7 @@ func (m *Manager) CheckApp(key string) (AppCheck, error) {
 			enabled = append(enabled, x)
 		}
 	}
-	res := AppCheck{Key: key, Egress: want, EgressDisplay: m.egressDisplayLocked(want), Since: since}
+	res := AppCheck{Key: key, Egress: want, EgressDisplay: m.egressDisplayLocked(want), Since: since, SinceKind: kind}
 	m.mu.RUnlock()
 
 	if want == "" {
@@ -205,7 +231,9 @@ func (m *Manager) CheckApp(key string) (AppCheck, error) {
 	if logPath == "" {
 		return res, fmt.Errorf("未开启转发日志（log_path），无法核对")
 	}
-	recs, err := readTraceTail(logPath, appCheckMaxBytes, since)
+	// 读满整个回看窗口：窗口起点之前的记录不计入实际出口，但其中出现过的
+	// 域名仍按当前规则复核。
+	recs, err := readTraceTail(logPath, appCheckMaxBytes, now.Add(-appCheckWindow))
 	if err != nil {
 		return res, fmt.Errorf("读取转发日志失败: %w", err)
 	}
@@ -225,9 +253,19 @@ func (m *Manager) CheckApp(key string) (AppCheck, error) {
 	}
 	domains := map[string]*AppDomain{}
 	suspects := map[string]*AppDomain{}
+	seen := map[string]string{} // 归并名 → 一个真实主机，供按当前规则复核
 	for _, r := range recs {
+		o := owner(r.host)
+		if o == key {
+			if _, ok := seen[collapseHost(r.host)]; !ok {
+				seen[collapseHost(r.host)] = r.host
+			}
+		}
+		if r.ts.Before(since) {
+			continue
+		}
 		var bucket map[string]*AppDomain
-		switch o := owner(r.host); {
+		switch {
 		case o == key:
 			bucket = domains
 		case o == "" && a.HasKeyword(r.host) && r.egress != want:
@@ -249,7 +287,65 @@ func (m *Manager) CheckApp(key string) (AppCheck, error) {
 	}
 	res.Domains, res.Mismatch = finishDomains(domains, want)
 	res.Suspects, _ = finishDomains(suspects, want)
+	if eng != nil {
+		res.Current, res.CurrentMismatch = routeNow(eng, a, seen, want)
+	}
 	return res, nil
+}
+
+// routeNow 用当前规则判定最近见过的域名与应用的内置核心域名。
+func routeNow(eng *policy.Engine, a apps.App, seen map[string]string, want string) ([]AppRoute, int) {
+	hosts := map[string]string{}
+	for name, h := range seen {
+		hosts[name] = h
+	}
+	for _, d := range a.Core {
+		covered := false
+		for _, h := range seen {
+			if h == d || strings.HasSuffix(h, "."+d) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			hosts[d] = d
+		}
+	}
+	out := make([]AppRoute, 0, len(hosts))
+	bad := 0
+	for name, h := range hosts {
+		t, err := policy.ParseTarget(h)
+		if err != nil {
+			continue
+		}
+		dec := eng.Match(t)
+		r := AppRoute{Host: name, Rule: dec.Rule}
+		switch dec.Action {
+		case policy.ActionBlock:
+			r.Blocked, r.OK = true, true
+		case policy.ActionDirect:
+			r.Egress = "DIRECT"
+		default:
+			r.Egress = dec.Egress
+		}
+		if !r.Blocked {
+			r.OK = r.Egress == want
+		}
+		if !r.OK {
+			bad++
+		}
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].OK != out[j].OK {
+			return !out[i].OK
+		}
+		return out[i].Host < out[j].Host
+	})
+	if len(out) > appCheckMaxRows {
+		out = out[:appCheckMaxRows]
+	}
+	return out, bad
 }
 
 func finishDomains(in map[string]*AppDomain, want string) ([]AppDomain, int) {
@@ -287,6 +383,7 @@ func collapseHost(h string) string {
 }
 
 type traceRec struct {
+	ts     time.Time
 	host   string
 	egress string
 	rule   string
@@ -334,7 +431,7 @@ func readTraceTail(path string, maxBytes int64, since time.Time) ([]traceRec, er
 		if json.Unmarshal(line, &r) != nil || r.TS.Before(since) {
 			continue
 		}
-		rec := traceRec{host: hostOf(r.Target)}
+		rec := traceRec{ts: r.TS, host: hostOf(r.Target)}
 		for _, s := range r.Steps {
 			switch s.Stage {
 			case "policy":

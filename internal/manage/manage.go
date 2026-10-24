@@ -72,8 +72,6 @@ type Manager struct {
 	FetchRuleSet func(ctx context.Context, name, url string) error
 
 	started time.Time
-	// appChanged 记录应用出口最近一次变更时间，核对只看此后的转发。
-	appChanged map[string]time.Time
 }
 
 // ProfileDownloadURL 返回当前蜂窝 DNS 描述文件的 HTTPS 下载地址。
@@ -539,6 +537,7 @@ func (m *Manager) RemoveEgress(name string) error {
 	for k, eg := range m.Cfg.Apps {
 		if eg == name {
 			delete(m.Cfg.Apps, k)
+			delete(m.Cfg.AppsChanged, k)
 		}
 	}
 

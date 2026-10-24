@@ -42,6 +42,10 @@ type Config struct {
 	// 未出现的应用跟随默认规则。
 	Apps map[string]string `json:"apps,omitempty"`
 
+	// AppsChanged 记录应用出口最近一次变更的时间（Unix 秒）。核对只统计
+	// 变更之后的转发；与 Apps 同步落盘，重启后不会把变更前的记录算进来。
+	AppsChanged map[string]int64 `json:"apps_changed,omitempty"`
+
 	// PreferIPv4 让所有出口对 IPv6 字面量目标立即快速失败（0ms），
 	// 促使客户端 Happy Eyeballs 直接改用 IPv4。
 	//
