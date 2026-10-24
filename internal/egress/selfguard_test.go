@@ -24,12 +24,12 @@ func TestSelfConnectGuard(t *testing.T) {
 		}
 	})
 
-	SetGatewayIP(netip.MustParseAddr("177.0.143.37"))
+	SetGatewayIP(netip.MustParseAddr("203.0.113.37"))
 
 	blocked := []string{
-		"177.0.143.37:80",  // HTTP 接管
-		"177.0.143.37:443", // TLS/QUIC 接管
-		"177.0.143.37:853", // DoT
+		"203.0.113.37:80",  // HTTP 接管
+		"203.0.113.37:443", // TLS/QUIC 接管
+		"203.0.113.37:853", // DoT
 	}
 	for _, addr := range blocked {
 		if !IsSelfTakeover(addr) {
@@ -38,8 +38,8 @@ func TestSelfConnectGuard(t *testing.T) {
 	}
 
 	allowed := []string{
-		"177.0.143.37:20443", // 内网面板，不发起出站，不构成环路
-		"177.0.143.37:22",    // SSH
+		"203.0.113.37:20443", // 内网面板，不发起出站，不构成环路
+		"203.0.113.37:22",    // SSH
 		"8.8.8.8:443",        // 外部地址
 		"1.1.1.1:80",
 		"example.com:80", // 域名形式在本层不判定
@@ -55,9 +55,9 @@ func TestSelfConnectGuard(t *testing.T) {
 // 必须同样识别，否则环路会从 IPv6 路径漏过去。
 func TestSelfConnectGuardIPv4Mapped(t *testing.T) {
 	t.Cleanup(func() { SetGatewayIP(netip.Addr{}) })
-	SetGatewayIP(netip.MustParseAddr("177.0.143.37"))
+	SetGatewayIP(netip.MustParseAddr("203.0.113.37"))
 
-	if !IsSelfTakeover("[::ffff:177.0.143.37]:80") {
+	if !IsSelfTakeover("[::ffff:203.0.113.37]:80") {
 		t.Fatal("IPv4-mapped IPv6 形式的自连接未被拦截 —— 环路会从此漏过")
 	}
 }
@@ -67,7 +67,7 @@ func TestSelfConnectGuardDisabledWhenUnset(t *testing.T) {
 	t.Cleanup(func() { SetGatewayIP(netip.Addr{}) })
 	SetGatewayIP(netip.Addr{})
 
-	for _, addr := range []string{"177.0.143.37:80", "8.8.8.8:443"} {
+	for _, addr := range []string{"203.0.113.37:80", "8.8.8.8:443"} {
 		if IsSelfTakeover(addr) {
 			t.Errorf("未登记网关 IP 时 %s 不应被拦截", addr)
 		}
@@ -94,10 +94,10 @@ func TestMalformedAddrDoesNotPanic(t *testing.T) {
 		SetGatewayIP(netip.Addr{})
 		SetGatewayHost("")
 	})
-	SetGatewayIP(netip.MustParseAddr("177.0.143.37"))
-	SetGatewayHost("kfc.ke1e.de")
+	SetGatewayIP(netip.MustParseAddr("203.0.113.37"))
+	SetGatewayHost("gw.example.com")
 
-	for _, addr := range []string{"", "no-port", "177.0.143.37", ":::", "177.0.143.37:abc"} {
+	for _, addr := range []string{"", "no-port", "203.0.113.37", ":::", "203.0.113.37:abc"} {
 		if IsSelfTakeover(addr) {
 			t.Errorf("畸形地址 %q 不应被判定为自连接", addr)
 		}
@@ -114,19 +114,19 @@ func TestGatewayHostnameBlockedAcrossEgresses(t *testing.T) {
 		SetGatewayIP(netip.Addr{})
 		SetGatewayHost("")
 	})
-	SetGatewayIP(netip.MustParseAddr("177.0.143.37"))
-	SetGatewayHost("KFC.KE1E.DE.")
+	SetGatewayIP(netip.MustParseAddr("203.0.113.37"))
+	SetGatewayHost("GW.EXAMPLE.COM.")
 
 	for _, addr := range []string{
-		"kfc.ke1e.de:80",
-		"KFC.KE1E.DE:443",
-		"kfc.ke1e.de.:853",
+		"gw.example.com:80",
+		"GW.EXAMPLE.COM:443",
+		"gw.example.com.:853",
 	} {
 		if !IsSelfTakeover(addr) {
 			t.Errorf("网关域名 %s 应被判定为自连接", addr)
 		}
 	}
-	if IsSelfTakeover("kfc.ke1e.de:20443") {
+	if IsSelfTakeover("gw.example.com:20443") {
 		t.Fatal("面板端口不发起出站，不应误拦")
 	}
 	if IsSelfTakeover("other.example:443") {
@@ -143,19 +143,19 @@ func TestGatewayHostnameBlockedAcrossEgresses(t *testing.T) {
 		call func() error
 	}{
 		{"direct_tcp", func() error {
-			_, err := direct.DialContext(ctx, "tcp", "kfc.ke1e.de:443")
+			_, err := direct.DialContext(ctx, "tcp", "gw.example.com:443")
 			return err
 		}},
 		{"direct_udp", func() error {
-			_, err := direct.DialUDP(ctx, "kfc.ke1e.de:443")
+			_, err := direct.DialUDP(ctx, "gw.example.com:443")
 			return err
 		}},
 		{"socks_tcp", func() error {
-			_, err := socks.DialContext(ctx, "tcp", "kfc.ke1e.de:443")
+			_, err := socks.DialContext(ctx, "tcp", "gw.example.com:443")
 			return err
 		}},
 		{"socks_udp", func() error {
-			_, err := socks.DialUDP(ctx, "kfc.ke1e.de:443")
+			_, err := socks.DialUDP(ctx, "gw.example.com:443")
 			return err
 		}},
 	}

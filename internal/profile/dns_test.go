@@ -8,7 +8,7 @@ import (
 
 func TestDNSProfileCellularOnly(t *testing.T) {
 	o := DefaultDNS("kfc.example.com")
-	o.ServerAddresses = []string{"177.0.143.37"}
+	o.ServerAddresses = []string{"203.0.113.37"}
 	b, err := o.Build()
 	if err != nil {
 		t.Fatal(err)
@@ -20,7 +20,7 @@ func TestDNSProfileCellularOnly(t *testing.T) {
 		"<string>TLS</string>",
 		"<key>ServerName</key>",
 		"<string>kfc.example.com</string>",
-		"<string>177.0.143.37</string>",
+		"<string>203.0.113.37</string>",
 		"<key>OnDemandRules</key>",
 		"<key>InterfaceTypeMatch</key>",
 		"<string>Cellular</string>",

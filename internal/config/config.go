@@ -164,7 +164,7 @@ type PanelConfig struct {
 // GatewayConfig 是 HTTPS 管理端点配置。
 type GatewayConfig struct {
 	Listen   string `json:"listen"` // 例如 ":20443"
-	Host     string `json:"host"`   // 证书主机名，例如 kfc.ke1e.de
+	Host     string `json:"host"`   // 证书主机名，例如 gw.example.com
 	CertFile string `json:"cert_file"`
 	KeyFile  string `json:"key_file"`
 	// ProfilePath 是 iOS 描述文件下载路径（含随机串）。
