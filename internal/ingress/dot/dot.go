@@ -36,8 +36,10 @@ type Server struct {
 	ClientCIDR netip.Prefix
 	// Upstream 是上游解析器，形如 "223.5.5.5:53"
 	Upstream []string
-	// TLS 证书
+	// TLS 证书。GetCertificate 非空时优先使用（续期后热加载），否则启动时
+	// 从 CertFile/KeyFile 加载一次。
 	CertFile, KeyFile string
+	GetCertificate    func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
 	// Policy 用于判断域名该直连还是走代理
 	Policy func() *policy.Engine
@@ -81,19 +83,20 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	s.cache = make(map[string]cacheEntry)
 	s.client = &dns.Client{Net: "udp", Timeout: 4 * time.Second}
 
-	cert, err := tls.LoadX509KeyPair(s.CertFile, s.KeyFile)
-	if err != nil {
-		return fmt.Errorf("DoT 加载证书失败: %w", err)
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: s.GetCertificate}
+	if s.GetCertificate == nil {
+		cert, err := tls.LoadX509KeyPair(s.CertFile, s.KeyFile)
+		if err != nil {
+			return fmt.Errorf("DoT 加载证书失败: %w", err)
+		}
+		tlsCfg.Certificates = []tls.Certificate{cert}
 	}
 
 	s.srvTCP = &dns.Server{
-		Addr: s.Listen,
-		Net:  "tcp-tls",
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		},
-		Handler: dns.HandlerFunc(s.handle),
+		Addr:      s.Listen,
+		Net:       "tcp-tls",
+		TLSConfig: tlsCfg,
+		Handler:   dns.HandlerFunc(s.handle),
 	}
 
 	go func() {

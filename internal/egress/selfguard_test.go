@@ -3,6 +3,7 @@ package egress
 import (
 	"context"
 	"errors"
+	"net"
 	"net/netip"
 	"testing"
 	"time"
@@ -198,5 +199,58 @@ func TestDirectDialRejectsHostnameResolvedToSelf(t *testing.T) {
 	}
 	if !errors.Is(err, ErrSelfConnect) {
 		t.Fatalf("UDP 域名解析回网关后应返回 ErrSelfConnect，得到 %v", err)
+	}
+}
+
+// TestPublicOnlyBlocksResolvedLoopback 接管拨号连域名也不能落到回环：
+// 公网域名完全可以把 A 记录指向 127.0.0.1。网关自身的出站不受影响。
+func TestPublicOnlyBlocksResolvedLoopback(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	d := NewDirect("DIRECT")
+
+	ctx := PublicOnly(context.Background())
+	for _, target := range []string{"localhost:" + port, ln.Addr().String()} {
+		if c, err := d.DialContext(ctx, "tcp", target); !errors.Is(err, ErrNonPublicTarget) {
+			if c != nil {
+				c.Close()
+			}
+			t.Fatalf("%s: err = %v, 期望 ErrNonPublicTarget", target, err)
+		}
+	}
+	if _, err := d.DialUDP(ctx, "127.0.0.1:443"); !errors.Is(err, ErrNonPublicTarget) {
+		t.Fatalf("UDP: err = %v, 期望 ErrNonPublicTarget", err)
+	}
+
+	c, err := d.DialContext(context.Background(), "tcp", "localhost:"+port)
+	if err != nil {
+		t.Fatalf("非接管拨号不应受限: %v", err)
+	}
+	c.Close()
+}
+
+func TestIsPublicAddr(t *testing.T) {
+	for s, want := range map[string]bool{
+		"1.1.1.1": true, "142.250.1.1": true, "2606:4700::1111": true,
+		"127.0.0.1": false, "10.1.2.3": false, "172.22.0.5": false, "192.168.1.1": false,
+		"169.254.169.254": false, "100.64.0.1": false, "0.0.0.0": false, "::1": false,
+		"fe80::1": false, "fd00::1": false, "::ffff:127.0.0.1": false, "224.0.0.1": false,
+	} {
+		if got := IsPublicAddr(netip.MustParseAddr(s)); got != want {
+			t.Errorf("IsPublicAddr(%s) = %v, 期望 %v", s, got, want)
+		}
 	}
 }

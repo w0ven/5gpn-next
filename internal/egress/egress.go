@@ -56,7 +56,7 @@ func NewDirect(name string) *Direct {
 		dialer: &net.Dialer{
 			Timeout:        DialTimeout,
 			KeepAlive:      30 * time.Second,
-			ControlContext: guardResolvedSelfTakeover,
+			ControlContext: guardResolved,
 		},
 	}
 }
@@ -69,6 +69,9 @@ func (d *Direct) DialContext(ctx context.Context, network, addr string) (net.Con
 	// 瞬间打满 TIME_WAIT 并把内核 slab 撑爆导致 OOM。
 	if IsSelfTakeover(addr) {
 		return nil, ErrSelfConnect
+	}
+	if err := guardPublicLiteral(ctx, addr); err != nil {
+		return nil, err
 	}
 	if err := guardIPv6(addr, d.hasV6); err != nil {
 		return nil, err
@@ -159,6 +162,9 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (net.Con
 	// 因而必须在交给上游前拦截网关自身域名/IP，避免跨节点递归回本机。
 	if IsSelfTakeover(addr) {
 		return nil, ErrSelfConnect
+	}
+	if err := guardPublicLiteral(ctx, addr); err != nil {
+		return nil, err
 	}
 	// 节点无 v6 能力时对 IPv6 字面量快速失败，促使客户端 Happy Eyeballs
 	// 立即回落 IPv4；有 v6 能力则由节点代拨（SOCKS ATYP=4）。

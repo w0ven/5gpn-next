@@ -6,9 +6,9 @@ package manage
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net"
 	"os"
@@ -67,6 +67,9 @@ type Manager struct {
 
 	// Health 是内置健康监控（可为空）
 	Health *monitor.Monitor
+
+	// RuleSetDir 是规则集缓存目录，为空时用默认位置。
+	RuleSetDir string
 
 	// FetchRuleSet 在缓存缺失时下载规则集（可为空）。
 	FetchRuleSet func(ctx context.Context, name, url string) error
@@ -271,11 +274,17 @@ func (m *Manager) AddEgress(name, link string) (string, error) {
 
 	// 每个出口一个独立 mihomo 实例。端口取当前已用最大值 +1，
 	// 不能用 len(egress)：删除后再添加会与存活实例撞端口。
+	// 还要跳过实际被占用的端口：校验连到的若是别的进程（例如没停掉的
+	// 旧实例），新节点会显示“验证通过”，流量却走旧节点。
 	port := 7891
 	for _, e := range m.Cfg.Egress {
 		if p, ok := localPort(e.Addr); ok && p >= port {
 			port = p + 1
 		}
+	}
+	port, err = freeLocalPort(port)
+	if err != nil {
+		return "", err
 	}
 
 	// 配置放 /var/lib：服务开启 ProtectSystem=full 后 /etc 只读，
@@ -381,7 +390,7 @@ func displayOf(e config.EgressConfig) string {
 		return e.DisplayName
 	}
 	if e.Name == "DIRECT" && e.Type == "direct" {
-		return "KFC 本机出口"
+		return "网关本机出口"
 	}
 	return e.Name
 }
@@ -410,6 +419,7 @@ func ensureMihomo() error {
 	out, err := exec.CommandContext(ctx, "systemd-run",
 		"--quiet", "--wait", "--collect",
 		"--property=Type=oneshot",
+		"--description=5gpn-next 安装 mihomo",
 		"/bin/sh", "-c", script).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("下载安装失败: %v: %s", err, strings.TrimSpace(string(out)))
@@ -521,10 +531,19 @@ func (m *Manager) RemoveEgress(name string) error {
 		return fmt.Errorf("出口 %q 不存在", name)
 	}
 
-	_ = systemctl("disable", "--now", "mihomo-5gpn@"+name+".service")
+	if err := stopUnit("mihomo-5gpn@" + name + ".service"); err != nil {
+		return fmt.Errorf("停止出口服务失败: %w", err)
+	}
+	// 旧版安装脚本为首个节点建的是独立单元而不是模板实例，必须一并停掉，
+	// 否则它继续占着端口，之后新加的出口会被它冒名顶替。
+	if lp, ok := legacyMihomoPort(); ok {
+		if p, ok := localPort(m.Cfg.Egress[idx].Addr); ok && p == lp {
+			if err := stopUnit(legacyMihomoUnit); err != nil {
+				return fmt.Errorf("停止安装时创建的出口服务失败: %w", err)
+			}
+		}
+	}
 	_ = os.RemoveAll(egressDir + "/" + name)
-	// 旧版本的配置位置（沙箱内只读，删不掉也无妨）
-	_ = os.RemoveAll("/etc/mihomo-5gpn/" + name)
 
 	m.Cfg.Egress = append(m.Cfg.Egress[:idx], m.Cfg.Egress[idx+1:]...)
 
@@ -826,12 +845,16 @@ func (m *Manager) AdAllowlist() []string {
 	return append([]string(nil), m.Cfg.AdBlock.Allowlist...)
 }
 
-// RemoveAdAllow 按序号移除白名单条目。
-func (m *Manager) RemoveAdAllow(idx int) error {
+// RemoveAdAllow 按序号移除白名单条目；expect 非空时必须与该位置一致，
+// 防止列表被另一端改过后删错。
+func (m *Manager) RemoveAdAllow(idx int, expect string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if idx < 0 || idx >= len(m.Cfg.AdBlock.Allowlist) {
-		return fmt.Errorf("序号 %d 超出范围", idx+1)
+		return fmt.Errorf("白名单已变化，请刷新后重试")
+	}
+	if expect != "" && m.Cfg.AdBlock.Allowlist[idx] != expect {
+		return fmt.Errorf("白名单已变化，为避免误删已取消，请刷新后重试")
 	}
 	m.Cfg.AdBlock.Allowlist = append(m.Cfg.AdBlock.Allowlist[:idx], m.Cfg.AdBlock.Allowlist[idx+1:]...)
 	return m.saveAndReloadLocked()
@@ -848,31 +871,6 @@ func (m *Manager) Rules() []string {
 	return out
 }
 
-// AddRule 追加一条规则。插入到 FINAL 之前、其它规则之后。
-func (m *Manager) AddRule(rule string) error {
-	rule = strings.TrimSpace(rule)
-	parts := strings.Split(rule, ",")
-	if len(parts) < 3 {
-		return fmt.Errorf("格式应为 类型,值,动作，例如 DOMAIN-SUFFIX,openai.com,proxy:node")
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// 新规则插到最前，便于覆盖既有的大规则集
-	m.Cfg.Rules = append([]string{rule}, m.Cfg.Rules...)
-	return m.saveAndReloadLocked()
-}
-
-// RemoveRule 按序号删除规则。
-func (m *Manager) RemoveRule(idx int) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if idx < 0 || idx >= len(m.Cfg.Rules) {
-		return fmt.Errorf("序号超出范围")
-	}
-	m.Cfg.Rules = append(m.Cfg.Rules[:idx], m.Cfg.Rules[idx+1:]...)
-	return m.saveAndReloadLocked()
-}
-
 // ---------- 诊断 ----------
 
 // Probe 对目标执行全链路诊断。
@@ -880,7 +878,9 @@ func (m *Manager) Probe(ctx context.Context, target string) *trace.Trace {
 	m.mu.RLock()
 	p := &probe.Prober{Policy: m.Policy, Egress: m.Egress}
 	m.mu.RUnlock()
-	return p.Run(ctx, NormalizeTarget(target))
+	// 诊断模拟的是手机经网关的访问，与接管入口一样不代连回环/内网地址；
+	// 面板查看免登录，不能借诊断让网关去连本机内部服务。
+	return p.Run(egress.PublicOnly(ctx), NormalizeTarget(target))
 }
 
 // NormalizeTarget 把用户输入清洗成 host[:port]。
@@ -951,6 +951,13 @@ func (m *Manager) UpdateHistory(limit int) []update.TxResult {
 	return update.History(limit)
 }
 
+// EgressConfigs 返回出口配置副本。
+func (m *Manager) EgressConfigs() []config.EgressConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]config.EgressConfig(nil), m.Cfg.Egress...)
+}
+
 // MonitorSettings 返回告警设置（含默认值归一）。
 func (m *Manager) MonitorSettings() (alertAfter, cooldownMin int, disabled bool) {
 	m.mu.RLock()
@@ -990,18 +997,13 @@ func (m *Manager) SetMonitorAlerts(alertAfter, cooldownMin int, disabled *bool) 
 		return err
 	}
 	if m.Health != nil {
-		if m.Cfg.Monitor.AlertAfter > 0 {
-			m.Health.AlertAfter = m.Cfg.Monitor.AlertAfter
-		}
-		if m.Cfg.Monitor.AlertCooldownMinutes > 0 {
-			m.Health.AlertCooldown = time.Duration(m.Cfg.Monitor.AlertCooldownMinutes) * time.Minute
-		}
+		m.Health.SetAlertPolicy(m.Cfg.Monitor.AlertAfter,
+			time.Duration(m.Cfg.Monitor.AlertCooldownMinutes)*time.Minute)
 	}
 	return nil
 }
 
-// SetUpdateInterval 调整检查间隔（小时）并持久化。
-// 注意：运行中的检查循环用的是启动时读取的间隔，改动重启后完全生效。
+// SetUpdateInterval 调整检查间隔（小时）并持久化，检查循环每分钟读取一次。
 func (m *Manager) SetUpdateInterval(hours int) error {
 	if hours < 1 || hours > 168 {
 		return fmt.Errorf("间隔 %d 小时超出范围（1-168）", hours)
@@ -1128,12 +1130,24 @@ func (m *Manager) RollbackVersions() []string {
 }
 
 // Rollback 回退到指定版本。
+//
+// 先还原 certbot 的 standalone 续期配置：旧版本不会在 :80 应答 webroot
+// 挑战，留着改写后的配置会让证书再也续不上。回退到同样支持的版本时，
+// 它启动后会再改回来。
 func (m *Manager) Rollback(ctx context.Context, tag string) (string, error) {
 	if m.Updater == nil {
 		return "", fmt.Errorf("更新功能未启用")
 	}
+	m.mu.RLock()
+	certFile := m.Cfg.Gateway.CertFile
+	m.mu.RUnlock()
+	if _, err := restoreStandalone(ctx, certFile); err != nil {
+		return "", fmt.Errorf("还原证书续期配置失败，已取消回退: %w", err)
+	}
 	return m.Updater.Rollback(ctx, tag)
 }
+
+var restoreStandalone = certrenew.RestoreStandalone
 
 // ReloadRuntime 仅重建运行态（策略引擎/出口），不改配置文件。
 // 供规则集后台刷新等场景使用。
@@ -1141,13 +1155,17 @@ func (m *Manager) ReloadRuntime() error {
 	if m.Reload == nil {
 		return nil
 	}
+	// 读盘、建引擎、替换运行态必须与 saveAndReloadLocked 共用同一把写锁
+	// 整段串行：否则后台刷新拿着旧配置建好的引擎，会在用户刚保存的新引擎
+	// 之后才写入，把新规则悄悄覆盖掉；两份完整引擎同时构建也会在 512MB
+	// 上限下撞 OOM。
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	p, e, err := m.Reload()
 	if err != nil {
 		return err
 	}
-	m.mu.Lock()
 	m.Policy, m.Egress = p, e
-	m.mu.Unlock()
 	return nil
 }
 
@@ -1157,10 +1175,8 @@ func (m *Manager) ReloadRuntime() error {
 //
 // 失败时回滚到磁盘上的旧配置，避免内存态与磁盘态不一致。
 func (m *Manager) saveAndReloadLocked() error {
-	backup := m.ConfigPath + ".rollback"
-	if b, err := os.ReadFile(m.ConfigPath); err == nil {
-		_ = os.WriteFile(backup, b, 0o600)
-	}
+	// 旧配置留在内存里：/etc 在服务沙箱内只读，备份文件写不进去。
+	prev, prevErr := os.ReadFile(m.ConfigPath)
 	if err := m.Cfg.Save(m.ConfigPath); err != nil {
 		return fmt.Errorf("保存配置失败: %w", err)
 	}
@@ -1169,27 +1185,28 @@ func (m *Manager) saveAndReloadLocked() error {
 	}
 	p, e, err := m.Reload()
 	if err != nil {
-		// 回滚
-		if b, rerr := os.ReadFile(backup); rerr == nil {
-			_ = os.WriteFile(m.ConfigPath, b, 0o600)
-			if c, cerr := config.Load(m.ConfigPath); cerr == nil {
-				m.Cfg = c
-			}
-			if rp, re, rerr2 := m.Reload(); rerr2 == nil {
-				m.Policy, m.Egress = rp, re
-			}
+		if prevErr != nil {
+			return fmt.Errorf("应用配置失败，且读不到旧配置无法回滚: %w", err)
+		}
+		if werr := config.WriteFileSandboxSafe(m.ConfigPath, prev, 0o600); werr != nil {
+			return fmt.Errorf("应用配置失败，回滚写入也失败（%v）: %w", werr, err)
+		}
+		if c, cerr := config.Load(m.ConfigPath); cerr == nil {
+			m.Cfg = c
+		}
+		if rp, re, rerr := m.Reload(); rerr == nil {
+			m.Policy, m.Egress = rp, re
 		}
 		return fmt.Errorf("应用配置失败，已回滚: %w", err)
 	}
 	// 调用方已持有写锁，直接赋值
 	m.Policy, m.Egress = p, e
-	_ = os.Remove(backup)
 	return nil
 }
 
 // egressDir 存放各出口的 mihomo 配置与运行数据。
 // 必须位于 /var/lib：主服务 ProtectSystem=full 下 /etc 只读。
-const egressDir = "/var/lib/mihomo-5gpn"
+var egressDir = "/var/lib/mihomo-5gpn"
 
 const mihomoUnitPath = "/etc/systemd/system/mihomo-5gpn@.service"
 
@@ -1242,27 +1259,117 @@ func ensureMihomoUnit() error {
 	return systemctl("daemon-reload")
 }
 
-// writeFileMaybeSandboxed 写文件；直接写失败（典型为沙箱内 /etc 只读）时，
-// 通过 systemd-run 请求 PID 1 在沙箱外代写。内容经 base64 传递，避免引号问题。
+// writeFileMaybeSandboxed 写文件；沙箱内 /etc 只读时由 PID 1 在沙箱外代写。
 func writeFileMaybeSandboxed(path string, data []byte, mode os.FileMode) error {
-	if err := os.WriteFile(path, data, mode); err == nil {
-		return nil
-	}
-	b64 := base64.StdEncoding.EncodeToString(data)
-	script := fmt.Sprintf("echo %s | base64 -d > %q && chmod %o %q", b64, path, mode, path)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "systemd-run",
-		"--quiet", "--wait", "--collect",
-		"--property=Type=oneshot",
-		"/bin/sh", "-c", script).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	return config.WriteFileSandboxSafe(path, data, mode)
 }
 
-func systemctl(args ...string) error {
+// 旧版安装脚本创建的独立出口单元（非模板实例）。
+const (
+	legacyMihomoUnit     = "mihomo-5gpn.service"
+	legacyMihomoUnitPath = "/etc/systemd/system/mihomo-5gpn.service"
+	legacyMihomoConfig   = "/etc/mihomo-5gpn/config.yaml"
+)
+
+// legacyMihomoPort 返回旧版独立单元监听的 SOCKS 端口；不存在时 ok=false。
+func legacyMihomoPort() (int, bool) {
+	if _, err := os.Stat(legacyMihomoUnitPath); err != nil {
+		return 0, false
+	}
+	b, err := os.ReadFile(legacyMihomoConfig)
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "socks-port:"); ok {
+			if p, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && p > 0 {
+				return p, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// freeLocalPort 从 start 起找第一个本机回环上未被占用的端口。
+func freeLocalPort(start int) (int, error) {
+	for p := start; p < start+200 && p <= 65535; p++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err != nil {
+			continue
+		}
+		ln.Close()
+		return p, nil
+	}
+	return 0, fmt.Errorf("从 %d 起找不到空闲端口", start)
+}
+
+// stopUnit 停用并关闭单元。systemctl 报错但单元确实不在运行时视为成功
+// （例如实例从未启用过）；仍在运行则必须报错，不能假装已删除。
+func stopUnit(unit string) error {
+	err := systemctl("disable", "--now", unit)
+	if err == nil {
+		return nil
+	}
+	if systemctl("is-active", "--quiet", unit) != nil {
+		return nil
+	}
+	return err
+}
+
+// StripMihomoController 去掉旧版生成的 mihomo 配置里的控制接口并重启
+// 对应实例。控制接口没有任何调用方，却以 root 身份无密码监听回环。
+// 返回被重启的实例名。
+func (m *Manager) StripMihomoController() []string {
+	m.mu.RLock()
+	var names []string
+	for _, e := range m.Cfg.Egress {
+		if e.Type == "socks5" {
+			names = append(names, e.Name)
+		}
+	}
+	m.mu.RUnlock()
+
+	var restarted []string
+	strip := func(path string, write func([]byte) error, unit string) {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return
+		}
+		var kept []string
+		for _, line := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "external-controller:") {
+				continue
+			}
+			kept = append(kept, line)
+		}
+		out := strings.Join(kept, "\n")
+		if out == string(b) {
+			return
+		}
+		if err := write([]byte(out)); err != nil {
+			log.Printf("去除 %s 的控制接口失败: %v", path, err)
+			return
+		}
+		if err := systemctl("try-restart", unit); err != nil {
+			log.Printf("重启 %s 失败: %v", unit, err)
+			return
+		}
+		restarted = append(restarted, unit)
+	}
+	for _, n := range names {
+		path := egressDir + "/" + n + "/config.yaml"
+		strip(path, func(b []byte) error { return os.WriteFile(path, b, 0o600) },
+			"mihomo-5gpn@"+n+".service")
+	}
+	if _, err := os.Stat(legacyMihomoUnitPath); err == nil {
+		strip(legacyMihomoConfig, func(b []byte) error {
+			return config.WriteFileSandboxSafe(legacyMihomoConfig, b, 0o600)
+		}, legacyMihomoUnit)
+	}
+	return restarted
+}
+
+var systemctl = func(args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "systemctl", args...).CombinedOutput()

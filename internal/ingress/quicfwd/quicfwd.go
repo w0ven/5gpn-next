@@ -358,7 +358,7 @@ func (sc *session) connect(ctx context.Context, pc net.PacketConn, host string) 
 	}
 	sc.tr.Step(trace.StageEgress, trace.StatusOK, "%s", d.Name())
 
-	dialCtx, cancel := context.WithTimeout(ctx, egress.DialTimeout)
+	dialCtx, cancel := context.WithTimeout(egress.PublicOnly(ctx), egress.DialTimeout)
 	defer cancel()
 	dialStart := time.Now()
 	remote, err := egress.DialUDPVia(dialCtx, d, target)

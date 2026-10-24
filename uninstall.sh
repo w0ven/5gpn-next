@@ -11,6 +11,7 @@ PURGE=0
 [ "${1:-}" = "--purge" ] && PURGE=1
 
 say() { printf '  %s\n' "$*"; }
+warn() { printf '  ! %s\n' "$*" >&2; }
 
 echo "==> 停止并禁用服务"
 # 无条件停止：不要用 `list-unit-files | grep -q` 做前置判断。
@@ -19,10 +20,21 @@ echo "==> 停止并禁用服务"
 for u in 5gpn-next 5gpn-next-nft mihomo-5gpn; do
   systemctl disable --now "${u}.service" >/dev/null 2>&1 || true
 done
+# 运行期添加的每个出口都是模板实例 mihomo-5gpn@<出口名>；只停模板本身
+# 停不掉它们，开机后还会被拉起。实例名取自启用链接与当前加载的单元。
+instances=$(
+  { ls /etc/systemd/system/*.wants/ 2>/dev/null
+    systemctl list-units --all --plain --no-legend 'mihomo-5gpn@*' 2>/dev/null | awk '{print $1}'
+  } | grep -oE '^mihomo-5gpn@[A-Za-z0-9_-]+\.service$' | sort -u
+)
+for u in $instances; do
+  systemctl disable --now "$u" >/dev/null 2>&1 || true
+  say "已停止出口实例 $u"
+done
 say "已停止相关服务"
 
 echo "==> 移除 systemd 单元"
-for u in 5gpn-next 5gpn-next-nft mihomo-5gpn; do
+for u in 5gpn-next 5gpn-next-nft mihomo-5gpn mihomo-5gpn@; do
   rm -f "/etc/systemd/system/${u}.service"
 done
 systemctl daemon-reload
@@ -36,6 +48,20 @@ for pat in /usr/local/bin/5gpnd /usr/local/bin/mihomo; do
     sleep 1
     pkill -9 -f "$pat" >/dev/null 2>&1 || true
   fi
+done
+
+echo "==> 移除证书续期钩子"
+# 只删本项目的钩子；证书本身不动（可能被同机其它服务使用）。
+for kind in pre post deploy; do
+  rm -f "/etc/letsencrypt/renewal-hooks/${kind}/5gpn-next.sh"
+done
+say "已删除 /etc/letsencrypt/renewal-hooks/*/5gpn-next.sh"
+# 网关曾把续期方式从 standalone 改为由自己应答挑战（webroot）；网关卸载后
+# 没人应答，必须还原，否则这张证书再也续不上。
+for bak in /etc/letsencrypt/renewal/*.conf.5gpn-standalone; do
+  [ -e "$bak" ] || continue
+  mv -f "$bak" "${bak%.5gpn-standalone}"
+  say "已还原续期配置 ${bak%.5gpn-standalone}"
 done
 
 echo "==> 清理防火墙规则"

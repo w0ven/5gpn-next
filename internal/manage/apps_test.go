@@ -273,3 +273,26 @@ func TestRouteNowTreatsBlockedAsExpected(t *testing.T) {
 		t.Fatalf("blocked=%d direct=%d bad=%d routes=%+v", blocked, direct, bad, routes)
 	}
 }
+
+// TestReadTraceTailIncludesRotatedArchive 轮转后当前日志只剩几条，
+// 核对窗口不能因此缩水。
+func TestReadTraceTailIncludesRotatedArchive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "trace.jsonl")
+	line := func(ts, host string) string {
+		return `{"ts":"` + ts + `","target":"` + host + `:443","steps":[{"stage":"egress","status":"ok","detail":"att"}]}` + "\n"
+	}
+	if err := os.WriteFile(path+".1", []byte(line("2026-10-24T10:00:00Z", "old.example.com")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(line("2026-10-24T11:00:00Z", "new.example.com")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recs, err := readTraceTail(path, 1<<20, time.Date(2026, 10, 24, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 2 || recs[0].host != "old.example.com" || recs[1].host != "new.example.com" {
+		t.Fatalf("recs = %+v", recs)
+	}
+}

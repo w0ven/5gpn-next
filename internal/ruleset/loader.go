@@ -5,12 +5,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -62,6 +65,8 @@ func parseCIDRs(r io.Reader) (*CIDRSet, error) {
 type Fetcher struct {
 	CacheDir string
 	Client   *http.Client
+
+	now func() time.Time
 }
 
 // NewFetcher 构造 Fetcher。
@@ -90,9 +95,21 @@ func (f *Fetcher) Cached(name string) (string, bool) {
 	return "", false
 }
 
+// StaleError 表示下载失败但旧缓存仍可用。调用方可以继续用缓存，但必须
+// 把它当作一次失败：只要有缓存就报成功，上游地址失效或被墙时规则会
+// 无限期停在旧版本，连续失败告警也永远不会触发。
+type StaleError struct{ Err error }
+
+func (e *StaleError) Error() string { return e.Err.Error() + "（继续使用旧缓存）" }
+func (e *StaleError) Unwrap() error { return e.Err }
+
 // Fetch 下载规则集到缓存；失败时若已有缓存则返回缓存路径与 nil。
 func (f *Fetcher) Fetch(ctx context.Context, name, url string) (string, error) {
 	path, _, err := f.FetchChanged(ctx, name, url)
+	var stale *StaleError
+	if errors.As(err, &stale) {
+		return path, nil
+	}
 	return path, err
 }
 
@@ -107,7 +124,10 @@ func (f *Fetcher) Fetch(ctx context.Context, name, url string) (string, error) {
 //
 // 因此只有字节内容确实不同才返回 changed=true；网络失败回退缓存、
 // 内容一致、无 url 走缓存等情况一律 changed=false。
-func (f *Fetcher) FetchChanged(ctx context.Context, name, url string) (string, bool, error) {
+//
+// 下载失败但有缓存时返回缓存路径与 *StaleError。每次带 url 的检查结果
+// 都记入状态文件，供状态页与失败告警使用。
+func (f *Fetcher) FetchChanged(ctx context.Context, name, url string) (path string, changed bool, err error) {
 	dst := f.cachePath(name)
 	if url == "" {
 		if _, err := os.Stat(dst); err == nil {
@@ -115,6 +135,7 @@ func (f *Fetcher) FetchChanged(ctx context.Context, name, url string) (string, b
 		}
 		return "", false, fmt.Errorf("规则集 %s 无 url 且无缓存", name)
 	}
+	defer func() { f.record(name, err) }()
 
 	if err := os.MkdirAll(f.CacheDir, 0o755); err != nil {
 		return "", false, err
@@ -128,18 +149,20 @@ func (f *Fetcher) FetchChanged(ctx context.Context, name, url string) (string, b
 
 	resp, err := f.Client.Do(req)
 	if err != nil {
+		err = fmt.Errorf("下载 %s 失败: %w", name, err)
 		if _, statErr := os.Stat(dst); statErr == nil {
-			return dst, false, nil // fail-safe：回退缓存，未变化
+			return dst, false, &StaleError{err} // fail-safe：回退缓存，未变化
 		}
-		return "", false, fmt.Errorf("下载 %s 失败: %w", name, err)
+		return "", false, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		err = fmt.Errorf("下载 %s 返回 HTTP %d", name, resp.StatusCode)
 		if _, statErr := os.Stat(dst); statErr == nil {
-			return dst, false, nil
+			return dst, false, &StaleError{err}
 		}
-		return "", false, fmt.Errorf("下载 %s 返回 %d", name, resp.StatusCode)
+		return "", false, err
 	}
 
 	tmp := dst + ".tmp"
@@ -186,4 +209,88 @@ func fileSHA256(path string) ([]byte, error) {
 		return nil, err
 	}
 	return h.Sum(nil), nil
+}
+
+// Status 是规则集最近一次联网检查的结果。
+type Status struct {
+	LastCheck   time.Time `json:"last_check"`
+	LastSuccess time.Time `json:"last_success,omitempty"`
+	LastError   string    `json:"last_error,omitempty"`
+	Fails       int       `json:"fails,omitempty"` // 连续失败次数
+}
+
+const statusFile = "status.json"
+
+// 多个 Fetcher 实例共用同一个状态文件。
+var statusMu sync.Mutex
+
+// Statuses 返回全部规则集的检查状态；从未检查过的不在其中。
+func (f *Fetcher) Statuses() map[string]Status {
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	return f.readStatus()
+}
+
+// CacheInfo 返回缓存文件的最后修改时间（即内容最后一次变化的时间）。
+func (f *Fetcher) CacheInfo(name string) (time.Time, bool) {
+	st, err := os.Stat(f.cachePath(name))
+	if err != nil || st.Size() == 0 {
+		return time.Time{}, false
+	}
+	return st.ModTime(), true
+}
+
+func (f *Fetcher) readStatus() map[string]Status {
+	m := map[string]Status{}
+	b, err := os.ReadFile(filepath.Join(f.CacheDir, statusFile))
+	if err == nil {
+		_ = json.Unmarshal(b, &m)
+	}
+	return m
+}
+
+func (f *Fetcher) record(name string, err error) {
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	m := f.readStatus()
+	st := m[name]
+	now := time.Now()
+	if f.now != nil {
+		now = f.now()
+	}
+	st.LastCheck = now
+	if err == nil {
+		st.LastSuccess, st.LastError, st.Fails = now, "", 0
+	} else {
+		st.LastError, st.Fails = err.Error(), st.Fails+1
+	}
+	m[name] = st
+	b, jerr := json.MarshalIndent(m, "", "  ")
+	if jerr != nil {
+		return
+	}
+	path := filepath.Join(f.CacheDir, statusFile)
+	if os.MkdirAll(f.CacheDir, 0o755) != nil || os.WriteFile(path+".tmp", b, 0o644) != nil {
+		return
+	}
+	_ = os.Rename(path+".tmp", path)
+}
+
+// RetryAfterFailure 是检查失败后再次尝试的最短间隔。
+const RetryAfterFailure = time.Hour
+
+// Due 报告规则集现在是否该联网检查。intervalHours 为 0 时按 24 小时，
+// 为负数时不自动更新。失败后不等满一个周期，隔 RetryAfterFailure 就重试。
+func Due(intervalHours int, st Status, now time.Time) bool {
+	if intervalHours < 0 {
+		return false
+	}
+	if intervalHours == 0 {
+		intervalHours = 24
+	}
+	if st.LastCheck.IsZero() {
+		return true
+	}
+	return now.Sub(st.LastSuccess) >= time.Duration(intervalHours)*time.Hour &&
+		now.Sub(st.LastCheck) >= RetryAfterFailure
 }

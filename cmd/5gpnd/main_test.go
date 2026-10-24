@@ -4,9 +4,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/w0ven/5gpn-next/internal/config"
+	"github.com/w0ven/5gpn-next/internal/manage"
 	"github.com/w0ven/5gpn-next/internal/policy"
 	"github.com/w0ven/5gpn-next/internal/ruleset"
 )
@@ -205,5 +208,56 @@ func TestAppRoutingCoreWorksWithoutList(t *testing.T) {
 		if d := e.Match(target(t, h)); d.Egress != "ctc" {
 			t.Errorf("%s => egress=%q rule=%s，清单缺失时核心域名仍应走 ctc", h, d.Egress, d.Rule)
 		}
+	}
+}
+
+// TestEgressAlertsFollowLiveToggle Bot 里切换告警开关必须立即生效，
+// 不能只在启动时决定是否接上推送。
+func TestEgressAlertsFollowLiveToggle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := &config.Config{}
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	mgr := manage.New(path, cfg, nil, nil)
+	var got []string
+	hub := &notifyHub{}
+	hub.Set(func(s string) { got = append(got, s) })
+	send := egressAlerts(mgr, hub)
+
+	send("a")
+	off, on := true, false
+	if err := mgr.SetMonitorAlerts(0, 0, &off); err != nil {
+		t.Fatal(err)
+	}
+	send("b")
+	if err := mgr.SetMonitorAlerts(0, 0, &on); err != nil {
+		t.Fatal(err)
+	}
+	send("c")
+	if strings.Join(got, ",") != "a,c" {
+		t.Fatalf("推送 = %v, 期望 [a c]", got)
+	}
+}
+
+func TestRulesetAlertsOnceAndRecover(t *testing.T) {
+	sets := []config.RuleSetConfig{{Name: "cn-domain", URL: "https://x"}, {Name: "local", Path: "/x"}}
+	alerted := map[string]bool{}
+	st := map[string]ruleset.Status{"cn-domain": {Fails: 2, LastError: "HTTP 404"}}
+	if got := rulesetAlerts(sets, st, alerted); len(got) != 0 {
+		t.Fatalf("未到阈值不应告警: %v", got)
+	}
+	st["cn-domain"] = ruleset.Status{Fails: 3, LastError: "HTTP 404"}
+	got := rulesetAlerts(sets, st, alerted)
+	if len(got) != 1 || !strings.Contains(got[0], "HTTP 404") {
+		t.Fatalf("应告警一次: %v", got)
+	}
+	st["cn-domain"] = ruleset.Status{Fails: 4, LastError: "HTTP 404"}
+	if got := rulesetAlerts(sets, st, alerted); len(got) != 0 {
+		t.Fatalf("不应重复告警: %v", got)
+	}
+	st["cn-domain"] = ruleset.Status{}
+	if got := rulesetAlerts(sets, st, alerted); len(got) != 1 || !strings.Contains(got[0], "恢复") {
+		t.Fatalf("应发恢复通知: %v", got)
 	}
 }

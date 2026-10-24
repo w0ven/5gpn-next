@@ -13,6 +13,66 @@ import (
 // ErrSelfConnect 表示目标地址就是网关自身的接管端口，拨号会形成环路。
 var ErrSelfConnect = errors.New("目标为网关自身接管端口，已阻断自连接环路")
 
+// ErrNonPublicTarget 表示接管连接的目标是回环、内网或链路本地地址。
+// 接管入口替客户端出站，若放行这类目标，客户端网段内任何设备都能借网关
+// 访问本机只监听回环的服务（如 mihomo 控制接口）或云厂商元数据地址。
+var ErrNonPublicTarget = errors.New("目标是回环/内网地址，接管入口不代为访问")
+
+type publicOnlyKey struct{}
+
+// PublicOnly 标记该次拨号来自接管入口：只允许连接公网地址。
+// 网关自身的探测、下载等出站不带此标记，行为不变。
+func PublicOnly(ctx context.Context) context.Context {
+	return context.WithValue(ctx, publicOnlyKey{}, true)
+}
+
+func isPublicOnly(ctx context.Context) bool {
+	v, _ := ctx.Value(publicOnlyKey{}).(bool)
+	return v
+}
+
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+}
+
+// IsPublicAddr 报告 ip 是否为可经公网路由的单播地址。
+func IsPublicAddr(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if !ip.IsValid() || ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+		return false
+	}
+	for _, p := range nonPublicPrefixes {
+		if p.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+// guardPublicLiteral 在拨号前拦下 IP 字面量形式的非公网目标。
+// 域名目标经 DIRECT 解析后由 guardResolved 再查；经 SOCKS5 时由节点
+// 远端解析，落不到网关本机。
+func guardPublicLiteral(ctx context.Context, addr string) error {
+	if !isPublicOnly(ctx) {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil
+	}
+	if ip, err := netip.ParseAddr(host); err == nil && !IsPublicAddr(ip) {
+		return ErrNonPublicTarget
+	}
+	return nil
+}
+
 // 接管端口：DoT 改写把域名指向网关 IP，客户端流量因而落到这些端口。
 // 若出站再连回同一 IP 的同一端口，就会自己连自己。
 var takeoverPorts = map[int]struct{}{
@@ -72,7 +132,7 @@ func GatewayHost() (string, bool) {
 // 一律拦截会误伤。非接管端口不构成环路，因为那些端口不会再发起出站。
 //
 // 域名先与已登记的网关域名精确比较；DIRECT 经过 DNS 解析后还会由
-// guardResolvedSelfTakeover 对 net.Dialer 选中的实际 IP 再检查，防住
+// guardResolved 对 net.Dialer 选中的实际 IP 再检查，防住
 // CNAME/别名解析回网关 IP 的情况。
 func IsSelfTakeover(addr string) bool {
 	host, portStr, err := net.SplitHostPort(addr)
@@ -102,16 +162,19 @@ func normalizeHost(host string) string {
 	return strings.TrimSuffix(host, ".")
 }
 
-// guardResolvedSelfTakeover 是 DIRECT net.Dialer 的最后一道防线。
+// guardResolved 是 DIRECT net.Dialer 的最后一道防线。
 //
 // ControlContext 在 DNS 解析完成、socket connect 发生前被调用；此时
 // address 已是 net.Dialer 实际选中的 IP:port。原实现只在解析前检查
 // addr，域名会直接放过，且注释声称“解析后再检查”但实际没有调用点。
 // 生产验证中，对网关自身域名各发一次 HTTP/HTTPS 请求，就分别递归出
 // 1024 条连接并撞上并发闸门，cgroup 峰值由 59MB 抬到约 140MB。
-func guardResolvedSelfTakeover(_ context.Context, _ string, address string, _ syscall.RawConn) error {
+//
+// 接管入口的拨号还要拦下解析到回环/内网的域名（如公网域名把 A 记录
+// 指向 127.0.0.1 或 169.254.169.254）。
+func guardResolved(ctx context.Context, _ string, address string, _ syscall.RawConn) error {
 	if IsSelfTakeover(address) {
 		return ErrSelfConnect
 	}
-	return nil
+	return guardPublicLiteral(ctx, address)
 }

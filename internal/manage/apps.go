@@ -391,22 +391,39 @@ type traceRec struct {
 
 // readTraceTail 读取转发日志尾部 maxBytes 内、时间不早于 since 的记录。
 // 只保留实际建立了出站连接（出口步骤成功）的记录。
+//
+// 日志轮转后当前文件可能只有几分钟的记录，预算没用完时接着读上一份
+// 归档（path.1），否则核对窗口会在轮转后突然缩水。
 func readTraceTail(path string, maxBytes int64, since time.Time) ([]traceRec, error) {
-	f, err := os.Open(path)
+	cur, size, err := readTraceFileTail(path, maxBytes, since)
 	if err != nil {
 		return nil, err
+	}
+	if rest := maxBytes - size; rest > 0 {
+		if prev, _, perr := readTraceFileTail(path+".1", rest, since); perr == nil {
+			cur = append(prev, cur...)
+		}
+	}
+	return cur, nil
+}
+
+// readTraceFileTail 读取单个日志文件尾部，同时返回文件大小。
+func readTraceFileTail(path string, maxBytes int64, since time.Time) ([]traceRec, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	off := st.Size() - maxBytes
 	if off < 0 {
 		off = 0
 	}
 	if _, err := f.Seek(off, io.SeekStart); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
@@ -446,7 +463,7 @@ func readTraceTail(path string, maxBytes int64, since time.Time) ([]traceRec, er
 			out = append(out, rec)
 		}
 	}
-	return out, sc.Err()
+	return out, st.Size(), sc.Err()
 }
 
 func hostOf(target string) string {

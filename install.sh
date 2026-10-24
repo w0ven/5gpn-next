@@ -486,22 +486,28 @@ if [ -n "$NODE" ]; then
   fi
   ok "mihomo $(/usr/local/bin/mihomo -v 2>&1 | sed -n '1p' | awk '{print $3}')"
 
-  install -d -m 700 /etc/mihomo-5gpn
-  install -d -m 750 /var/lib/mihomo-5gpn
+  # 与运行期添加的出口完全一致：模板实例 mihomo-5gpn@<出口名>，配置放
+  # /var/lib/mihomo-5gpn/<出口名>。旧版的独立 mihomo-5gpn.service 删除出口时
+  # 不会被停掉，再加新节点会复用同一端口，流量悄悄继续走旧节点。
+  install -d -m 750 /var/lib/mihomo-5gpn /var/lib/mihomo-5gpn/node
 
   /usr/local/bin/5gpnd node-config \
     -link "$CFGDIR/node.link" \
-    -out /etc/mihomo-5gpn/config.yaml \
+    -out /var/lib/mihomo-5gpn/node/config.yaml \
     -socks 7891 || die "节点链接解析失败，请检查格式"
-  chmod 600 /etc/mihomo-5gpn/config.yaml
+  chmod 600 /var/lib/mihomo-5gpn/node/config.yaml
 
-  /usr/local/bin/mihomo -t -d /var/lib/mihomo-5gpn -f /etc/mihomo-5gpn/config.yaml >/dev/null 2>&1 \
+  /usr/local/bin/mihomo -t -d /var/lib/mihomo-5gpn/node -f /var/lib/mihomo-5gpn/node/config.yaml >/dev/null 2>&1 \
     || die "mihomo 配置校验失败"
 
-  cat > /etc/systemd/system/mihomo-5gpn.service <<'EOF'
+  if [ -f /etc/systemd/system/mihomo-5gpn.service ]; then
+    systemctl disable --now mihomo-5gpn.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/mihomo-5gpn.service
+  fi
+
+  cat > /etc/systemd/system/mihomo-5gpn@.service <<'EOF'
 [Unit]
-Description=mihomo egress for 5gpn-next
-Documentation=https://github.com/MetaCubeX/mihomo
+Description=mihomo egress %i for 5gpn-next
 After=network-online.target
 Wants=network-online.target
 StartLimitBurst=10
@@ -509,7 +515,7 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/mihomo -d /var/lib/mihomo-5gpn -f /etc/mihomo-5gpn/config.yaml
+ExecStart=/usr/local/bin/mihomo -d /var/lib/mihomo-5gpn/%i -f /var/lib/mihomo-5gpn/%i/config.yaml
 Restart=on-failure
 RestartSec=3s
 NoNewPrivileges=true
@@ -537,9 +543,9 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now mihomo-5gpn.service >/dev/null 2>&1
+  systemctl enable --now mihomo-5gpn@node.service >/dev/null 2>&1
   sleep 2
-  systemctl is-active --quiet mihomo-5gpn.service || die "mihomo 启动失败：journalctl -u mihomo-5gpn -n 30"
+  systemctl is-active --quiet mihomo-5gpn@node.service || die "mihomo 启动失败：journalctl -u mihomo-5gpn@node -n 30"
 
   EXIT_IP=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:7891 https://api.ipify.org 2>/dev/null || echo "")
   if [ -n "$EXIT_IP" ] && [ "$EXIT_IP" != "$PUBIP" ]; then
@@ -746,10 +752,12 @@ install -d -m 755 /etc/letsencrypt/renewal-hooks/pre \
 
 cat > /etc/letsencrypt/renewal-hooks/pre/5gpn-next.sh <<'EOF'
 #!/bin/bash
-# 续期前停服让出 :80，并把 ACME 临时放行插到公网兜底 drop 之前。
-# 仅在服务确实运行时记录状态，避免续期后误启动本就停止的服务。
+# 续期前把 ACME 临时放行插到公网兜底 drop 之前。网关自己在 :80 应答
+# webroot 挑战，不用停服；只有续期配置仍是 standalone（certbot 要自己
+# 占用 :80）时才停服让出端口，并记录状态以便续期后恢复。
 set -u
 STATE=/run/5gpn-next-cert-renew.state
+date +%s > /var/lib/5gpn-next/cert-renew-attempt 2>/dev/null || true
 rm_rules() {
   local handle
   while read -r handle; do
@@ -759,7 +767,8 @@ rm_rules() {
     | awk '/comment "5gpn-acme-tmp"/ { for (i=1; i<=NF; i++) if ($i=="handle") print $(i+1) }')
 }
 rm_rules
-if systemctl is-active --quiet 5gpn-next.service; then
+if grep -qsE '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*standalone' /etc/letsencrypt/renewal/*.conf \
+  && systemctl is-active --quiet 5gpn-next.service; then
   echo stopped-by-certbot > "$STATE"
   systemctl stop 5gpn-next.service
 else
@@ -780,6 +789,7 @@ cat > /etc/letsencrypt/renewal-hooks/post/5gpn-next.sh <<'EOF'
 # 无论续期成功与否都先收回 ACME 临时公网放行，再恢复网关服务。
 set -u
 STATE=/run/5gpn-next-cert-renew.state
+date +%s > /var/lib/5gpn-next/cert-renew-finished 2>/dev/null || true
 while read -r handle; do
   [ -n "$handle" ] || continue
   nft delete rule inet fgpn input handle "$handle" 2>/dev/null || true
@@ -796,10 +806,10 @@ fi
 exit 0
 EOF
 
-# 新证书落地后重启以加载（post 钩子已负责启动，这里只处理未停服的情形）。
+# 新证书由网关检测文件变化后自行加载，deploy 钩子不再重启服务。
 cat > /etc/letsencrypt/renewal-hooks/deploy/5gpn-next.sh <<'EOF'
 #!/bin/bash
-systemctl is-active --quiet 5gpn-next.service && systemctl restart 5gpn-next.service
+# 网关会检测证书文件变化并自动加载新证书，无需重启。
 exit 0
 EOF
 

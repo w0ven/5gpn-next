@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,6 +29,7 @@ import (
 	"github.com/w0ven/5gpn-next/internal/manage"
 	"github.com/w0ven/5gpn-next/internal/monitor"
 	"github.com/w0ven/5gpn-next/internal/node"
+	"github.com/w0ven/5gpn-next/internal/panelauth"
 	"github.com/w0ven/5gpn-next/internal/policy"
 	"github.com/w0ven/5gpn-next/internal/probe"
 	"github.com/w0ven/5gpn-next/internal/profile"
@@ -59,6 +62,8 @@ func main() {
 		err = cmdProfile(args)
 	case "node-config":
 		err = cmdNodeConfig(args)
+	case "panel-login":
+		err = cmdPanelLogin(args)
 	case "check":
 		err = cmdCheck(args)
 	case "version", "-v", "--version":
@@ -83,6 +88,7 @@ func usage() {
   5gpnd profile -c <配置文件> -o <输出>   生成 iOS 描述文件
   5gpnd check   -c <配置文件>            校验配置（不启动服务）
   5gpnd node-config -link <文件> -out <文件>  由分享链接生成 mihomo 出口配置
+  5gpnd panel-login -c <配置文件>         生成一次性面板登录链接（无 Bot 时使用）
   5gpnd version
 
 说明:
@@ -219,6 +225,10 @@ func applyRules(cfg *config.Config, eng *policy.Engine) error {
 	// 不能因为选了出口就让广告不再被拦。
 	// 内置规则不在配置文件里，Bot/面板改不到也删不掉。
 	finalAct, finalEg := parseAction(cfg.Final)
+	defaultEg := "DIRECT"
+	if finalAct == policy.ActionProxy && finalEg != "" {
+		defaultEg = finalEg
+	}
 	googleFix := config.BuiltinGoogleFix()
 	if finalAct == policy.ActionProxy && finalEg != "" {
 		// 跟随当前默认国外出口；切换出口会触发热重载，这里随之更新。
@@ -244,6 +254,11 @@ func applyRules(cfg *config.Config, eng *policy.Engine) error {
 		kind := policy.RuleKind(strings.ToUpper(strings.TrimSpace(parts[0])))
 		val := strings.TrimSpace(parts[1])
 		act, eg := parseAction(strings.TrimSpace(parts[2]))
+		// 不带出口名的 proxy 跟随默认国外出口；默认是手机直连时由网关
+		// 本机直出。留空会在转发时找不到出口，记一次失败再回退。
+		if act == policy.ActionProxy && eg == "" {
+			eg = defaultEg
+		}
 
 		if err := eng.AddRule(policy.Rule{
 			Kind: kind, Value: val, Action: act, Egress: eg,
@@ -340,6 +355,13 @@ func cmdRun(args []string) error {
 	health := monitor.New()
 	health.PersistPath = "/var/lib/5gpn-next/health.json"
 	health.Load()
+	// 退出前同步保存一次：周期落盘的 goroutine 在进程退出时来不及跑完，
+	// 升级或重启会丢掉最近一个周期的探测与转发样本。
+	defer func() {
+		if err := health.Save(); err != nil {
+			log.Printf("健康监控快照落盘失败: %v", err)
+		}
+	}()
 	if a.cfg.Monitor.AlertAfter > 0 {
 		health.AlertAfter = a.cfg.Monitor.AlertAfter
 	}
@@ -349,7 +371,9 @@ func cmdRun(args []string) error {
 	health.ProbeTarget = monitor.DefaultProbeRemote
 	health.Targets = func() []monitor.Target {
 		var out []monitor.Target
-		for _, e := range a.cfg.Egress {
+		// 必须经管理层加锁读取：热重载会整体替换 a.cfg，这里在探测
+		// goroutine 中并发读取。
+		for _, e := range mgr.EgressConfigs() {
 			if e.Addr != "" && e.Type == "socks5" {
 				// 经本机 mihomo 桥 CONNECT 后再做 HTTP 探测：只跟桥握手
 				// 测到的是 loopback 往返（几十微秒），面板上一排 0ms
@@ -384,6 +408,11 @@ func cmdRun(args []string) error {
 		return nil
 	}
 	mgr.Health = health
+	// 推送通道在 Bot 就绪后才接上。出口告警受「告警开关」控制，且每次
+	// 发送时读取当前设置，Bot 里切换立即生效；证书与规则集告警是系统
+	// 级提醒，不随出口告警开关关闭。
+	notify := &notifyHub{}
+	health.Notify = egressAlerts(mgr, notify)
 	// 计数器分散在 sniff（连接级）与 DoT（查询级），用闭包延迟聚合。
 	var sniffSrv *sniff.Server
 	var quicSrv *quicfwd.Server
@@ -475,6 +504,11 @@ func cmdRun(args []string) error {
 	// 而蜂窝多为 v6 环境（WhatsApp 优先连 Meta IPv6 字面量）。
 	// 启动后实测一次 SOCKS ATYP=4 代拨能力，变化则持久化并热重载。
 	go func() {
+		// 旧版生成的出口配置开着无密码的控制接口，升级后去掉并重启实例；
+		// 必须先于 IPv6 探测，否则探测会撞上正在重启的实例而误判。
+		if restarted := mgr.StripMihomoController(); len(restarted) > 0 {
+			log.Printf("已关闭出口实例的控制接口: %s", strings.Join(restarted, ", "))
+		}
 		time.Sleep(3 * time.Second) // 等 mihomo 实例就绪
 		changed, err := mgr.RefreshEgressIPv6(4 * time.Second)
 		if err != nil {
@@ -492,26 +526,34 @@ func cmdRun(args []string) error {
 	defer refreshCancel()
 	go func() {
 		fetcher := ruleset.NewFetcher("/var/lib/5gpn-next/rulesets")
-		// 连续整轮失败 2 次才告警：单轮失败可能只是网络抖动，只写日志
-		// 没人看，规则彻底刷不动时广告库/分流会悄悄退化。
-		consecFail := 0
-		alerted := false
-		// 启动后先刷一轮（缓存可能已陈旧或不存在）
+		alerted := map[string]bool{}
+		// 启动后先检查一轮：缓存可能已陈旧或不存在。之后每 10 分钟看一次
+		// 哪些规则集到期（各自的 interval_hours；失败后一小时重试）。
+		wait := time.Duration(0)
 		for {
+			select {
+			case <-refreshCtx.Done():
+				return
+			case <-time.After(wait):
+			}
+			wait = 10 * time.Minute
 			changed := false
-			anyFail := false
+			statuses := fetcher.Statuses()
 			// 必须使用 EffectiveRuleSets：默认广告规则由 ad_block 动态注入，
 			// 不在磁盘 rulesets 数组里。只遍历 cfg.RuleSets 会让广告库永不更新。
-			for _, rs := range mgr.EffectiveRuleSets() {
+			sets := mgr.EffectiveRuleSets()
+			for _, rs := range sets {
 				if rs.Path != "" || rs.URL == "" {
+					continue
+				}
+				if !ruleset.Due(rs.IntervalHours, statuses[rs.Name], time.Now()) {
 					continue
 				}
 				fctx, fcancel := context.WithTimeout(refreshCtx, 120*time.Second)
 				_, upd, err := fetcher.FetchChanged(fctx, rs.Name, rs.URL)
 				fcancel()
 				if err != nil {
-					log.Printf("规则集 %s 后台刷新失败: %v（继续用缓存）", rs.Name, err)
-					anyFail = true
+					log.Printf("规则集 %s 后台刷新失败: %v", rs.Name, err)
 					continue
 				}
 				if upd {
@@ -531,26 +573,8 @@ func cmdRun(args []string) error {
 					log.Printf("规则集已后台刷新并生效")
 				}
 			}
-			if anyFail {
-				consecFail++
-				if consecFail >= 2 && !alerted {
-					alerted = true
-					if health.Notify != nil {
-						health.Notify(fmt.Sprintf(
-							"⚠️ <b>规则集刷新连续 %d 轮失败</b>，广告拦截/分流规则可能滞后（仍在使用缓存）", consecFail))
-					}
-				}
-			} else {
-				if alerted && health.Notify != nil {
-					health.Notify("✅ <b>规则集刷新已恢复</b>")
-				}
-				consecFail = 0
-				alerted = false
-			}
-			select {
-			case <-refreshCtx.Done():
-				return
-			case <-time.After(24 * time.Hour):
+			for _, text := range rulesetAlerts(sets, fetcher.Statuses(), alerted) {
+				notify.Send(text)
 			}
 		}
 	}()
@@ -589,6 +613,34 @@ func cmdRun(args []string) error {
 	}
 	hookCancel()
 
+	// 证书只加载一次，DoT 与 HTTPS 共用；续期后按文件变化热加载，不用重启。
+	keyPair, err := certrenew.LoadKeyPair(a.cfg.Gateway.CertFile, a.cfg.Gateway.KeyFile)
+	if err != nil {
+		return fmt.Errorf("加载证书失败: %w", err)
+	}
+	// 网关自己在 :80 应答续期挑战时，把 certbot 从 standalone 改为 webroot，
+	// 续期不再停服。延后十分钟：升级事务若在健康检查阶段回退到旧版，旧版
+	// 不会应答挑战，不能留下已改写的续期配置。
+	acmeOnHTTP := a.cfg.DNS.Enabled && portOf(a.cfg.DNS.HTTPListen) == 80
+	if acmeOnHTTP {
+		go func() {
+			select {
+			case <-refreshCtx.Done():
+				return
+			case <-time.After(10 * time.Minute):
+			}
+			wctx, wcancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer wcancel()
+			if changed, werr := certrenew.EnsureWebroot(wctx, a.cfg.Gateway.CertFile); werr != nil {
+				log.Printf("警告: 切换证书续期方式失败（仍按停服方式续期）: %v", werr)
+			} else if changed {
+				log.Printf("证书续期已改为由网关应答挑战，续期期间不再停服")
+			}
+		}()
+	}
+
+	panelAuth := panelauth.New(panelauth.DefaultDir)
+
 	// 内网 Web 面板：挂在根路径，仅内网卡来源可达，无需登录
 	var panelHandler http.Handler
 	if a.cfg.Panel.Enabled {
@@ -596,6 +648,7 @@ func cmdRun(args []string) error {
 		if err != nil {
 			return fmt.Errorf("初始化面板失败: %w", err)
 		}
+		p.Auth = panelAuth
 		panelHandler = p.Handler()
 		log.Printf("内网面板已启用: https://%s:%d/（仅 %s 可访问）",
 			a.cfg.Gateway.Host, portOf(a.cfg.Gateway.Listen), a.cfg.ClientCIDR)
@@ -625,15 +678,18 @@ func cmdRun(args []string) error {
 		hints := hint.New()
 
 		sn := &sniff.Server{
-			Policy:     rt.Policy,
-			Egress:     rt.Egress,
-			Recorder:   rec,
-			OnConn:     traffic.Conn,
-			OnTraffic:  traffic.Traffic,
-			HintLookup: hints.Lookup,
-			ClientCIDR: clientPfx,
+			Policy:          rt.Policy,
+			Egress:          rt.Egress,
+			Recorder:        rec,
+			OnConn:          traffic.Conn,
+			OnTraffic:       traffic.Traffic,
+			HintLookup:      hints.Lookup,
+			ClientCIDR:      clientPfx,
 			OnDial:          health.RecordForward,
 			OnEgressTraffic: health.AddEgressTraffic,
+		}
+		if acmeOnHTTP {
+			sn.ACMEDir = certrenew.ACMEWebroot
 		}
 		sniffSrv = sn
 		health.SniffActive = sn.ActiveConns
@@ -649,14 +705,15 @@ func cmdRun(args []string) error {
 		}()
 
 		ds := &dot.Server{
-			Listen:     a.cfg.DNS.DoTListen,
-			GatewayIP:  gwIP,
-			OnRewrite:  hints.Add,
-			ClientCIDR: clientPfx,
-			Upstream:   a.cfg.DNS.Upstream,
-			CertFile:   a.cfg.Gateway.CertFile,
-			KeyFile:    a.cfg.Gateway.KeyFile,
-			Policy:     rt.Policy,
+			Listen:         a.cfg.DNS.DoTListen,
+			GatewayIP:      gwIP,
+			OnRewrite:      hints.Add,
+			ClientCIDR:     clientPfx,
+			Upstream:       a.cfg.DNS.Upstream,
+			CertFile:       a.cfg.Gateway.CertFile,
+			KeyFile:        a.cfg.Gateway.KeyFile,
+			GetCertificate: keyPair.GetCertificate,
+			Policy:         rt.Policy,
 			OnDecision: func(_ string, action string) {
 				dnsStats.record(action)
 			},
@@ -680,13 +737,13 @@ func cmdRun(args []string) error {
 		// Initial 包的 SNI 并按策略转发 UDP，让 HTTP/3 直接走通。
 		if a.cfg.DNS.QUICTakeoverEnabled() {
 			qs := &quicfwd.Server{
-				Policy:     rt.Policy,
-				Egress:     rt.Egress,
-				Recorder:   rec,
-				OnConn:     traffic.Conn,
-				OnTraffic:  traffic.Traffic,
-				HintLookup: hints.Lookup,
-				ClientCIDR: clientPfx,
+				Policy:          rt.Policy,
+				Egress:          rt.Egress,
+				Recorder:        rec,
+				OnConn:          traffic.Conn,
+				OnTraffic:       traffic.Traffic,
+				HintLookup:      hints.Lookup,
+				ClientCIDR:      clientPfx,
 				OnDial:          health.RecordForward,
 				OnEgressTraffic: health.AddEgressTraffic,
 			}
@@ -746,7 +803,6 @@ func cmdRun(args []string) error {
 		for {
 			select {
 			case <-ingressCtx.Done():
-				_ = health.Save()
 				return
 			case <-t.C:
 				if err := health.Save(); err != nil {
@@ -761,16 +817,20 @@ func cmdRun(args []string) error {
 	defer botCancel()
 	if a.cfg.Bot.Token != "" && len(a.cfg.Bot.Admins) > 0 {
 		tb := bot.New(a.cfg.Bot.Token, a.cfg.Bot.Admins, mgr, version)
-		if !a.cfg.Monitor.AlertsDisabled {
-			health.Notify = func(text string) {
-				nctx, ncancel := context.WithTimeout(botCtx, 30*time.Second)
-				tb.Notify(nctx, text)
-				ncancel()
-			}
-		}
+		notify.Set(func(text string) {
+			nctx, ncancel := context.WithTimeout(botCtx, 30*time.Second)
+			tb.Notify(nctx, text)
+			ncancel()
+		})
 		if panelHandler != nil {
-			tb.PanelURL = fmt.Sprintf("https://%s:%d/",
-				a.cfg.Gateway.Host, portOf(a.cfg.Gateway.Listen))
+			tb.PanelURL = panelURL(a.cfg)
+			tb.PanelLogin = func() (string, error) {
+				tok, err := panelAuth.IssueToken()
+				if err != nil {
+					return "", err
+				}
+				return tb.PanelURL + "login?t=" + tok, nil
+			}
 		}
 		go tb.Run(botCtx)
 
@@ -816,60 +876,58 @@ func cmdRun(args []string) error {
 
 		// 周期检查新版本并推送。默认只通知不安装，
 		// 避免在用户不知情时替换正在运行的二进制。
-		if a.cfg.Update.CheckEnabled {
-			// 兜底值必须与配置默认值同源，否则 interval_hours=0 的配置会
-			// 悄悄退回旧的 12 小时，与新默认脱节。
-			iv := time.Duration(a.cfg.Update.IntervalHours) * time.Hour
-			if iv <= 0 {
-				iv = config.DefaultUpdateIntervalHours * time.Hour
-			}
-			go func() {
-				t := time.NewTicker(iv)
-				defer t.Stop()
-				// 启动后先查一次再进入周期循环。否则新装或刚重启的机器要空等
-				// 满一个周期才可能收到提醒，期间用户完全不知道
-				// 已有新版本。延迟 20 秒是为了让 Bot 与网络就绪，避免开机瞬间
-				// 查询失败白白浪费这一次。
-				first := time.NewTimer(20 * time.Second)
-				defer first.Stop()
-				for {
-					select {
-					case <-botCtx.Done():
-						return
-					case <-first.C:
-					case <-t.C:
-					}
-					cctx, cancel := context.WithTimeout(botCtx, 60*time.Second)
-					has, rel, err := updater.HasUpdate(cctx)
-					cancel()
-					if err != nil || !has || mgr.IsIgnoredVersion(rel.Tag) || !updater.ShouldNotify(rel.Tag) {
-						continue
-					}
-					tb.NotifyAction(botCtx, fmt.Sprintf(
-						"\U0001F514 <b>发现新版本 %s</b>　当前 <code>%s</code>%s%s",
-						rel.Tag, version, nl2, htmlPre(rel.Notes, 800)),
-						"查看并升级", "update", "update")
-					if a.cfg.Update.AutoApply {
-						actx, acancel := context.WithTimeout(context.Background(), 5*time.Minute)
-						if out, aerr := updater.Apply(actx, rel.Tag); aerr == nil {
-							tb.Notify(botCtx, "\u2705 "+out)
-						} else {
-							tb.Notify(botCtx, "\u26A0\uFE0F 自动升级失败："+aerr.Error())
-						}
-						acancel()
-					}
+		// 开关与间隔每分钟从管理层读取一次：Bot 里改了立即生效，不用重启；
+		// 也不能读 a.cfg，热重载后它和管理层手里的配置已是两个对象。
+		go func() {
+			// 启动后先查一次再进入周期循环。否则新装或刚重启的机器要空等
+			// 满一个周期才可能收到提醒，期间用户完全不知道
+			// 已有新版本。延迟 20 秒是为了让 Bot 与网络就绪，避免开机瞬间
+			// 查询失败白白浪费这一次。
+			wait := 20 * time.Second
+			var last time.Time
+			for {
+				select {
+				case <-botCtx.Done():
+					return
+				case <-time.After(wait):
 				}
-			}()
-		}
+				wait = time.Minute
+				check, _, ivh := mgr.UpdateSettings()
+				if !check || (!last.IsZero() && time.Since(last) < time.Duration(ivh)*time.Hour) {
+					continue
+				}
+				last = time.Now()
+				cctx, cancel := context.WithTimeout(botCtx, 60*time.Second)
+				has, rel, err := updater.HasUpdate(cctx)
+				cancel()
+				if err != nil || !has || mgr.IsIgnoredVersion(rel.Tag) || !updater.ShouldNotify(rel.Tag) {
+					continue
+				}
+				tb.NotifyAction(botCtx, fmt.Sprintf(
+					"\U0001F514 <b>发现新版本 %s</b>　当前 <code>%s</code>%s%s",
+					rel.Tag, version, nl2, htmlPre(rel.Notes, 800)),
+					"查看并升级", "update", "update")
+				if _, auto, _ := mgr.UpdateSettings(); auto {
+					actx, acancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					if out, aerr := updater.Apply(actx, rel.Tag); aerr == nil {
+						tb.Notify(botCtx, "\u2705 "+out)
+					} else {
+						tb.Notify(botCtx, "\u26A0\uFE0F 自动升级失败："+aerr.Error())
+					}
+					acancel()
+				}
+			}
+		}()
 
 		// 证书过期后 DoT 握手全部失败，健康页只有打开时才看得到，必须主动推送。
-		if health.Notify != nil && a.cfg.Gateway.CertFile != "" {
+		if a.cfg.Gateway.CertFile != "" {
 			cw := &certrenew.ExpiryWatcher{
 				CertFile:  a.cfg.Gateway.CertFile,
 				StateFile: certrenew.AlertStateFile,
-				Notify:    health.Notify,
+				Notify:    notify.Send,
 			}
 			go cw.Run(botCtx, 20*time.Second, 12*time.Hour)
+			go cw.RunRenewal(botCtx, 30*time.Minute)
 		}
 	}
 
@@ -884,19 +942,14 @@ func cmdRun(args []string) error {
 		ClientCIDR:   clientPfx,
 	}
 
-	cert, err := tls.LoadX509KeyPair(a.cfg.Gateway.CertFile, a.cfg.Gateway.KeyFile)
-	if err != nil {
-		return fmt.Errorf("加载证书失败: %w", err)
-	}
-
 	hs := &http.Server{
 		Addr:              a.cfg.Gateway.Listen,
 		Handler:           root,
 		ReadHeaderTimeout: 10 * time.Second,
 		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-			NextProtos:   []string{"h2", "http/1.1"},
+			GetCertificate: keyPair.GetCertificate,
+			MinVersion:     tls.VersionTLS12,
+			NextProtos:     []string{"h2", "http/1.1"},
 		},
 		IdleTimeout: 5 * time.Minute,
 	}
@@ -1061,6 +1114,27 @@ func cmdCheck(args []string) error {
 
 // ---------- node-config ----------
 
+// cmdPanelLogin 在服务器上签发一次性面板登录链接，供没有配置 Bot 的部署使用。
+func cmdPanelLogin(args []string) error {
+	cfg, err := config.Load(flagValue(args, "-c", "/etc/5gpn-next/config.json"))
+	if err != nil {
+		return err
+	}
+	if !cfg.Panel.Enabled {
+		return fmt.Errorf("面板未启用（panel.enabled=false）")
+	}
+	tok, err := panelauth.New(panelauth.DefaultDir).IssueToken()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("用连着内网卡的手机在 10 分钟内打开（只能用一次）：\n%slogin?t=%s\n", panelURL(cfg), tok)
+	return nil
+}
+
+func panelURL(cfg *config.Config) string {
+	return fmt.Sprintf("https://%s:%d/", cfg.Gateway.Host, portOf(cfg.Gateway.Listen))
+}
+
 func cmdNodeConfig(args []string) error {
 	linkPath := flagValue(args, "-link", "")
 	outPath := flagValue(args, "-out", "")
@@ -1123,4 +1197,71 @@ func htmlPre(s string, limit int) string {
 	}
 	rep := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 	return "<pre>" + rep.Replace(s) + "</pre>"
+}
+
+// rulesetFailAlertAfter 是规则集连续检查失败多少次后告警。失败后每小时
+// 重试一次，单次失败多半只是网络抖动。
+const rulesetFailAlertAfter = 3
+
+// rulesetAlerts 根据最新检查状态生成告警与恢复通知，alerted 记录已告警的
+// 规则集，跨轮次复用。
+func rulesetAlerts(sets []config.RuleSetConfig, st map[string]ruleset.Status, alerted map[string]bool) []string {
+	var out []string
+	active := map[string]bool{}
+	for _, rs := range sets {
+		if rs.Path != "" || rs.URL == "" {
+			continue
+		}
+		active[rs.Name] = true
+		s := st[rs.Name]
+		switch {
+		case s.Fails >= rulesetFailAlertAfter && !alerted[rs.Name]:
+			alerted[rs.Name] = true
+			out = append(out, fmt.Sprintf(
+				"⚠️ <b>规则集 %s 更新失败</b>\n\n已连续 %d 次：%s\n\n%s",
+				html.EscapeString(rs.Name), s.Fails, html.EscapeString(s.LastError),
+				"仍在使用旧版本，广告拦截和分流规则可能滞后。可在「规则 → 规则集状态」查看。"))
+		case s.Fails == 0 && alerted[rs.Name]:
+			delete(alerted, rs.Name)
+			out = append(out, fmt.Sprintf("✅ <b>规则集 %s 已恢复更新</b>", html.EscapeString(rs.Name)))
+		}
+	}
+	for name := range alerted {
+		if !active[name] {
+			delete(alerted, name)
+		}
+	}
+	return out
+}
+
+// egressAlerts 返回出口告警的发送函数：每次发送时读取当前的告警开关。
+func egressAlerts(mgr *manage.Manager, hub *notifyHub) func(string) {
+	return func(text string) {
+		if _, _, disabled := mgr.MonitorSettings(); disabled {
+			return
+		}
+		hub.Send(text)
+	}
+}
+
+// notifyHub 是 Bot 推送通道。后台任务先于 Bot 启动，通道就绪前的
+// 消息直接丢弃（与未配置 Bot 时一致）。
+type notifyHub struct {
+	mu sync.RWMutex
+	fn func(string)
+}
+
+func (h *notifyHub) Set(fn func(string)) {
+	h.mu.Lock()
+	h.fn = fn
+	h.mu.Unlock()
+}
+
+func (h *notifyHub) Send(text string) {
+	h.mu.RLock()
+	fn := h.fn
+	h.mu.RUnlock()
+	if fn != nil {
+		fn(text)
+	}
 }

@@ -91,6 +91,7 @@ func newTestBot(t *testing.T) (*Bot, *fakeTG, *manage.Manager) {
 	b.apiBase, b.state = srv.URL, dir
 	b.screens = map[int64]int64{}
 	b.PanelURL = "https://gw.example:443/"
+	b.PanelLogin = func() (string, error) { return b.PanelURL + "login?t=0123abcd", nil }
 	return b, tg, mgr
 }
 
@@ -258,7 +259,7 @@ func TestScreensAreWellFormed(t *testing.T) {
 	for _, cmd := range []string{
 		"menu", "status", "traffic", "health", "monitor_settings",
 		"egress", "egress_info:DIRECT", "del_egress_ask:DIRECT", "ask_egress_add",
-		"rules", "rules_builtin", "ask_rule_add", "rule_del_menu",
+		"rules", "rules_builtin", "ask_rule_add", "rule_del_menu", "rulesets", "panel_login",
 		"apps", "app:youtube", "app:claude",
 		"adblock", "ad_allow_list", "ask_ad_allow", "ad_extras", "ad_suspects",
 		"probe", "client", "update", "update_settings", "update_history",
@@ -397,5 +398,30 @@ func TestSparkline(t *testing.T) {
 	got := sparkline([]stats.DayCount{{Count: 0}, {Count: 5}, {Count: 10}})
 	if got != "▁▅█" {
 		t.Fatalf("sparkline = %q", got)
+	}
+}
+
+// TestRuleAddShowsEffectAndFlagsBrokenRules 添加规则后告诉用户实际效果；
+// 旧版本留下的无效规则在列表里标出来。
+func TestRuleAddShowsEffectAndFlagsBrokenRules(t *testing.T) {
+	b, tg, mgr := newTestBot(t)
+	ctx := context.Background()
+	b.screens[admin] = 50
+	mgr.Cfg.Rules = []string{"FINAL,,block"}
+
+	b.handle(ctx, press(50, "ask_rule_add"))
+	tg.take()
+	b.handle(ctx, message(60, admin, "DOMAIN-SUFFIX,example.org,block"))
+	var text string
+	for _, c := range tg.take() {
+		if c.method == "editMessageText" || c.method == "sendMessage" {
+			text = c.p.Get("text")
+		}
+	}
+	if !strings.Contains(text, "example.org") || !strings.Contains(text, "已添加") {
+		t.Fatalf("应显示添加效果: %s", text)
+	}
+	if !strings.Contains(text, "不生效") {
+		t.Fatalf("无效的旧规则应被标出: %s", text)
 	}
 }

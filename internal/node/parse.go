@@ -55,25 +55,88 @@ func Parse(raw string) (*Node, error) {
 	}
 	scheme := strings.ToLower(s[:i])
 
+	var (
+		n   *Node
+		err error
+	)
 	switch scheme {
 	case "ss":
-		return parseSS(s)
+		n, err = parseSS(s)
 	case "vless":
-		return parseVLESS(s)
+		n, err = parseVLESS(s)
 	case "trojan":
-		return parseTrojan(s)
+		n, err = parseTrojan(s)
 	case "hysteria2", "hy2":
-		return parseHysteria2(s)
+		n, err = parseHysteria2(s)
 	case "vmess":
-		return parseVMess(s)
+		n, err = parseVMess(s)
 	case "socks5", "socks":
-		return parseSocksHTTP(s, "socks5")
+		n, err = parseSocksHTTP(s, "socks5")
 	case "http", "https":
-		return parseSocksHTTP(s, "http")
+		n, err = parseSocksHTTP(s, "http")
 	case "tuic":
-		return parseTUIC(s)
+		n, err = parseTUIC(s)
+	default:
+		return nil, fmt.Errorf("暂不支持的协议 %q", scheme)
 	}
-	return nil, fmt.Errorf("暫不支持的协议 %q（mihomo 支持但本解析器未覆盖，可手写 /etc/mihomo-5gpn/config.yaml）", scheme)
+	if err != nil {
+		return nil, err
+	}
+	if err := n.validate(); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+// validate 拒绝不可能出现在正常节点里的字段值。
+//
+// 渲染时虽然逐字段转义，但带换行或空白的服务器地址只会让 mihomo 起不来，
+// 或者是一条被刻意构造的链接：在入口处就给出明确错误。
+func (n *Node) validate() error {
+	if !validServer(n.Server) {
+		return fmt.Errorf("服务器地址 %q 无效", n.Server)
+	}
+	fields := map[string]string{
+		"cipher": n.Cipher, "password": n.Password, "uuid": n.UUID,
+		"security": n.Security, "network": n.Network, "sni": n.SNI,
+		"flow": n.Flow, "fp": n.ClientFP, "pbk": n.PublicKey, "sid": n.ShortID,
+		"path": n.WSPath, "host": n.WSHost, "username": n.Username,
+	}
+	for _, a := range n.ALPN {
+		fields["alpn"] += a
+	}
+	for k, v := range fields {
+		if strings.IndexFunc(v, isControl) >= 0 {
+			return fmt.Errorf("节点参数 %s 含有非法控制字符", k)
+		}
+	}
+	for k, v := range map[string]string{"uuid": n.UUID, "sni": n.SNI, "host": n.WSHost, "network": n.Network, "flow": n.Flow, "fp": n.ClientFP} {
+		if strings.ContainsAny(v, " \t\"'`{}[]#&*!|>%@") {
+			return fmt.Errorf("节点参数 %s 含有非法字符", k)
+		}
+	}
+	return nil
+}
+
+func isControl(r rune) bool { return r < 0x20 || r == 0x7f }
+
+// validServer 只接受 IP 或由字母、数字、点、连字符、下划线组成的域名。
+func validServer(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	if net.ParseIP(s) != nil {
+		return true
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.' || r == '-' || r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ---------- 各协议 ----------

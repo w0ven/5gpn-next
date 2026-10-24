@@ -155,6 +155,17 @@ func (e *Engine) DomainSetLen(name string) int {
 	return ds.Len()
 }
 
+// CIDRSetLen 返回指定 IP 段规则集的条数；未注册时返回 0。
+func (e *Engine) CIDRSetLen(name string) int {
+	e.mu.RLock()
+	cs := e.cidrSets[name]
+	e.mu.RUnlock()
+	if cs == nil {
+		return 0
+	}
+	return cs.Len()
+}
+
 // DomainSetMatch 报告 host 是否命中指定域名规则集；规则集未注册时为 false。
 func (e *Engine) DomainSetMatch(name, host string) bool {
 	e.mu.RLock()

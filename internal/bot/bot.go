@@ -41,6 +41,8 @@ type Bot struct {
 
 	// PanelURL 是内网面板地址，供菜单展示
 	PanelURL string
+	// PanelLogin 签发一次性面板登录链接（可为空：面板未启用登录）。
+	PanelLogin func() (string, error)
 
 	client *http.Client
 	offset int64
@@ -625,6 +627,10 @@ func (b *Bot) dispatch(ctx context.Context, v view, cmd string) {
 	// 分流
 	case "rules":
 		b.showRules(ctx, v)
+	case "rulesets":
+		b.showRuleSets(ctx, v)
+	case "panel_login":
+		b.showPanelLogin(ctx, v)
 	case "rules_builtin":
 		b.showBuiltinRules(ctx, v)
 	case "ask_rule_add":
@@ -664,8 +670,15 @@ func (b *Bot) dispatch(ctx context.Context, v view, cmd string) {
 	case "ad_allow_list":
 		b.showAdAllowlist(ctx, v)
 	case "ad_allow_del":
-		idx, _ := strconv.Atoi(arg)
-		if err := b.Manager.RemoveAdAllow(idx); err != nil {
+		idxStr, fp, _ := strings.Cut(arg, ":")
+		idx, _ := strconv.Atoi(idxStr)
+		list := b.Manager.AdAllowlist()
+		if idx < 0 || idx >= len(list) || ruleFingerprint(list[idx]) != fp {
+			b.ack(ctx, v, "白名单已变化，为避免误删已取消，请重新选择", true)
+			b.showAdAllowlist(ctx, v)
+			return
+		}
+		if err := b.Manager.RemoveAdAllow(idx, list[idx]); err != nil {
 			b.fail(ctx, v, "移除失败", err, "ad_allow_list")
 			return
 		}
@@ -763,7 +776,7 @@ var prompts = map[string]struct{ icon, title, body, back string }{
 		"某个 App 被误拦（白屏、加载不出来）时，发送它的域名，例如 <code>example.com</code>。\n<i>连同子域名一起放行。</i>",
 		"ad_allow_list"},
 	"update_interval": {"settings", "检查间隔",
-		"发送 1-168 的小时数，例如 <code>1</code> 或 <code>6</code>。\n<i>下次重启起完全生效。</i>", "update_settings"},
+		"发送 1-168 的小时数，例如 <code>1</code> 或 <code>6</code>。", "update_settings"},
 }
 
 func (b *Bot) askFor(ctx context.Context, v view, action, errNote string) {
@@ -802,11 +815,12 @@ func (b *Bot) handleInput(ctx context.Context, v view, action, text string) {
 			"<i>支持 ss · vless · vmess · trojan · hysteria2 · tuic · socks5 · http</i>", "egress")
 
 	case "rule_add":
-		if err := b.Manager.AddRule(text); err != nil {
+		msg, err := b.Manager.AddRule(text)
+		if err != nil {
 			b.askRuleAdd(ctx, v, err.Error())
 			return
 		}
-		b.showRules(ctx, v)
+		b.showRulesNote(ctx, v, msg)
 
 	case "ad_allow":
 		if err := b.Manager.AllowAd(text); err != nil {

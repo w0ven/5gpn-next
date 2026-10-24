@@ -2,12 +2,15 @@ package ruleset
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestFetchChangedOnlyReportsRealContentChange 锁定线上 OOM 事故：
@@ -80,8 +83,12 @@ func TestFetchChangedNetworkFailureFallsBackWithoutChange(t *testing.T) {
 
 	// 指向一个立即失败的地址
 	p, ch, err := f.FetchChanged(context.Background(), "cn-domain", "http://127.0.0.1:1/nope")
-	if err != nil {
-		t.Fatalf("有缓存时网络失败不应报错: %v", err)
+	var stale *StaleError
+	if !errors.As(err, &stale) {
+		t.Fatalf("有缓存时网络失败应报 StaleError（继续用缓存但要计为失败）: %v", err)
+	}
+	if _, ferr := f.Fetch(context.Background(), "cn-domain", "http://127.0.0.1:1/nope"); ferr != nil {
+		t.Fatalf("Fetch 有缓存时应继续可用: %v", ferr)
 	}
 	if ch {
 		t.Fatal("网络失败回退缓存却报告 changed=true —— 断网会触发重载风暴")
@@ -106,8 +113,9 @@ func TestFetchChangedUpstreamErrorKeepsCache(t *testing.T) {
 	defer srv.Close()
 
 	_, ch, err := f.FetchChanged(context.Background(), "ad-block", srv.URL)
-	if err != nil {
-		t.Fatalf("有缓存时上游 5xx 不应报错: %v", err)
+	var stale *StaleError
+	if !errors.As(err, &stale) {
+		t.Fatalf("有缓存时上游 5xx 应报 StaleError: %v", err)
 	}
 	if ch {
 		t.Fatal("上游 5xx 却报告 changed=true")
@@ -148,5 +156,61 @@ func TestFetchWrapperStillWorks(t *testing.T) {
 	p, err := f.Fetch(context.Background(), "cn-domain", srv.URL)
 	if err != nil || p == "" {
 		t.Fatalf("Fetch 包装失效: p=%q err=%v", p, err)
+	}
+}
+
+// TestFetchRecordsStatus 每次检查都记入状态文件：失败累计次数，成功清零。
+func TestFetchRecordsStatus(t *testing.T) {
+	dir := t.TempDir()
+	f := NewFetcher(dir)
+	fail := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte("a.com\n"))
+	}))
+	defer srv.Close()
+
+	for i := 0; i < 2; i++ {
+		_, _, _ = f.FetchChanged(context.Background(), "x", srv.URL)
+	}
+	st := f.Statuses()["x"]
+	if st.Fails != 2 || !strings.Contains(st.LastError, "404") || !st.LastSuccess.IsZero() {
+		t.Fatalf("失败状态不对: %+v", st)
+	}
+	fail = false
+	if _, _, err := f.FetchChanged(context.Background(), "x", srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	st = f.Statuses()["x"]
+	if st.Fails != 0 || st.LastError != "" || st.LastSuccess.IsZero() {
+		t.Fatalf("成功后状态不对: %+v", st)
+	}
+}
+
+func TestDue(t *testing.T) {
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	ok := Status{LastCheck: now.Add(-2 * time.Hour), LastSuccess: now.Add(-2 * time.Hour)}
+	failing := Status{LastCheck: now.Add(-90 * time.Minute), LastSuccess: now.Add(-30 * time.Hour), Fails: 3}
+	justFailed := Status{LastCheck: now.Add(-10 * time.Minute), LastSuccess: now.Add(-30 * time.Hour), Fails: 1}
+	for _, tc := range []struct {
+		name string
+		iv   int
+		st   Status
+		want bool
+	}{
+		{"从未检查", 24, Status{}, true},
+		{"两小时前刚成功", 24, ok, false},
+		{"两小时前成功但间隔 1 小时", 1, ok, true},
+		{"间隔未填按 24 小时", 0, ok, false},
+		{"负数不自动更新", -1, Status{}, false},
+		{"失败一小时后重试", 24, failing, true},
+		{"刚失败不立刻重试", 24, justFailed, false},
+	} {
+		if got := Due(tc.iv, tc.st, now); got != tc.want {
+			t.Errorf("%s: Due = %v, 期望 %v", tc.name, got, tc.want)
+		}
 	}
 }
