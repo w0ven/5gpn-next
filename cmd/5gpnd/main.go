@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -340,6 +342,13 @@ func cmdRun(args []string) error {
 	health := monitor.New()
 	health.PersistPath = "/var/lib/5gpn-next/health.json"
 	health.Load()
+	// 退出前同步保存一次：周期落盘的 goroutine 在进程退出时来不及跑完，
+	// 升级或重启会丢掉最近一个周期的探测与转发样本。
+	defer func() {
+		if err := health.Save(); err != nil {
+			log.Printf("健康监控快照落盘失败: %v", err)
+		}
+	}()
 	if a.cfg.Monitor.AlertAfter > 0 {
 		health.AlertAfter = a.cfg.Monitor.AlertAfter
 	}
@@ -349,7 +358,9 @@ func cmdRun(args []string) error {
 	health.ProbeTarget = monitor.DefaultProbeRemote
 	health.Targets = func() []monitor.Target {
 		var out []monitor.Target
-		for _, e := range a.cfg.Egress {
+		// 必须经管理层加锁读取：热重载会整体替换 a.cfg，这里在探测
+		// goroutine 中并发读取。
+		for _, e := range mgr.EgressConfigs() {
 			if e.Addr != "" && e.Type == "socks5" {
 				// 经本机 mihomo 桥 CONNECT 后再做 HTTP 探测：只跟桥握手
 				// 测到的是 loopback 往返（几十微秒），面板上一排 0ms
@@ -384,6 +395,11 @@ func cmdRun(args []string) error {
 		return nil
 	}
 	mgr.Health = health
+	// 推送通道在 Bot 就绪后才接上。出口告警受「告警开关」控制，且每次
+	// 发送时读取当前设置，Bot 里切换立即生效；证书与规则集告警是系统
+	// 级提醒，不随出口告警开关关闭。
+	notify := &notifyHub{}
+	health.Notify = egressAlerts(mgr, notify)
 	// 计数器分散在 sniff（连接级）与 DoT（查询级），用闭包延迟聚合。
 	var sniffSrv *sniff.Server
 	var quicSrv *quicfwd.Server
@@ -497,26 +513,34 @@ func cmdRun(args []string) error {
 	defer refreshCancel()
 	go func() {
 		fetcher := ruleset.NewFetcher("/var/lib/5gpn-next/rulesets")
-		// 连续整轮失败 2 次才告警：单轮失败可能只是网络抖动，只写日志
-		// 没人看，规则彻底刷不动时广告库/分流会悄悄退化。
-		consecFail := 0
-		alerted := false
-		// 启动后先刷一轮（缓存可能已陈旧或不存在）
+		alerted := map[string]bool{}
+		// 启动后先检查一轮：缓存可能已陈旧或不存在。之后每 10 分钟看一次
+		// 哪些规则集到期（各自的 interval_hours；失败后一小时重试）。
+		wait := time.Duration(0)
 		for {
+			select {
+			case <-refreshCtx.Done():
+				return
+			case <-time.After(wait):
+			}
+			wait = 10 * time.Minute
 			changed := false
-			anyFail := false
+			statuses := fetcher.Statuses()
 			// 必须使用 EffectiveRuleSets：默认广告规则由 ad_block 动态注入，
 			// 不在磁盘 rulesets 数组里。只遍历 cfg.RuleSets 会让广告库永不更新。
-			for _, rs := range mgr.EffectiveRuleSets() {
+			sets := mgr.EffectiveRuleSets()
+			for _, rs := range sets {
 				if rs.Path != "" || rs.URL == "" {
+					continue
+				}
+				if !ruleset.Due(rs.IntervalHours, statuses[rs.Name], time.Now()) {
 					continue
 				}
 				fctx, fcancel := context.WithTimeout(refreshCtx, 120*time.Second)
 				_, upd, err := fetcher.FetchChanged(fctx, rs.Name, rs.URL)
 				fcancel()
 				if err != nil {
-					log.Printf("规则集 %s 后台刷新失败: %v（继续用缓存）", rs.Name, err)
-					anyFail = true
+					log.Printf("规则集 %s 后台刷新失败: %v", rs.Name, err)
 					continue
 				}
 				if upd {
@@ -536,26 +560,8 @@ func cmdRun(args []string) error {
 					log.Printf("规则集已后台刷新并生效")
 				}
 			}
-			if anyFail {
-				consecFail++
-				if consecFail >= 2 && !alerted {
-					alerted = true
-					if health.Notify != nil {
-						health.Notify(fmt.Sprintf(
-							"⚠️ <b>规则集刷新连续 %d 轮失败</b>，广告拦截/分流规则可能滞后（仍在使用缓存）", consecFail))
-					}
-				}
-			} else {
-				if alerted && health.Notify != nil {
-					health.Notify("✅ <b>规则集刷新已恢复</b>")
-				}
-				consecFail = 0
-				alerted = false
-			}
-			select {
-			case <-refreshCtx.Done():
-				return
-			case <-time.After(24 * time.Hour):
+			for _, text := range rulesetAlerts(sets, fetcher.Statuses(), alerted) {
+				notify.Send(text)
 			}
 		}
 	}()
@@ -751,7 +757,6 @@ func cmdRun(args []string) error {
 		for {
 			select {
 			case <-ingressCtx.Done():
-				_ = health.Save()
 				return
 			case <-t.C:
 				if err := health.Save(); err != nil {
@@ -766,13 +771,11 @@ func cmdRun(args []string) error {
 	defer botCancel()
 	if a.cfg.Bot.Token != "" && len(a.cfg.Bot.Admins) > 0 {
 		tb := bot.New(a.cfg.Bot.Token, a.cfg.Bot.Admins, mgr, version)
-		if !a.cfg.Monitor.AlertsDisabled {
-			health.Notify = func(text string) {
-				nctx, ncancel := context.WithTimeout(botCtx, 30*time.Second)
-				tb.Notify(nctx, text)
-				ncancel()
-			}
-		}
+		notify.Set(func(text string) {
+			nctx, ncancel := context.WithTimeout(botCtx, 30*time.Second)
+			tb.Notify(nctx, text)
+			ncancel()
+		})
 		if panelHandler != nil {
 			tb.PanelURL = fmt.Sprintf("https://%s:%d/",
 				a.cfg.Gateway.Host, portOf(a.cfg.Gateway.Listen))
@@ -821,58 +824,55 @@ func cmdRun(args []string) error {
 
 		// 周期检查新版本并推送。默认只通知不安装，
 		// 避免在用户不知情时替换正在运行的二进制。
-		if a.cfg.Update.CheckEnabled {
-			// 兜底值必须与配置默认值同源，否则 interval_hours=0 的配置会
-			// 悄悄退回旧的 12 小时，与新默认脱节。
-			iv := time.Duration(a.cfg.Update.IntervalHours) * time.Hour
-			if iv <= 0 {
-				iv = config.DefaultUpdateIntervalHours * time.Hour
-			}
-			go func() {
-				t := time.NewTicker(iv)
-				defer t.Stop()
-				// 启动后先查一次再进入周期循环。否则新装或刚重启的机器要空等
-				// 满一个周期才可能收到提醒，期间用户完全不知道
-				// 已有新版本。延迟 20 秒是为了让 Bot 与网络就绪，避免开机瞬间
-				// 查询失败白白浪费这一次。
-				first := time.NewTimer(20 * time.Second)
-				defer first.Stop()
-				for {
-					select {
-					case <-botCtx.Done():
-						return
-					case <-first.C:
-					case <-t.C:
-					}
-					cctx, cancel := context.WithTimeout(botCtx, 60*time.Second)
-					has, rel, err := updater.HasUpdate(cctx)
-					cancel()
-					if err != nil || !has || mgr.IsIgnoredVersion(rel.Tag) || !updater.ShouldNotify(rel.Tag) {
-						continue
-					}
-					tb.NotifyAction(botCtx, fmt.Sprintf(
-						"\U0001F514 <b>发现新版本 %s</b>　当前 <code>%s</code>%s%s",
-						rel.Tag, version, nl2, htmlPre(rel.Notes, 800)),
-						"查看并升级", "update", "update")
-					if a.cfg.Update.AutoApply {
-						actx, acancel := context.WithTimeout(context.Background(), 5*time.Minute)
-						if out, aerr := updater.Apply(actx, rel.Tag); aerr == nil {
-							tb.Notify(botCtx, "\u2705 "+out)
-						} else {
-							tb.Notify(botCtx, "\u26A0\uFE0F 自动升级失败："+aerr.Error())
-						}
-						acancel()
-					}
+		// 开关与间隔每分钟从管理层读取一次：Bot 里改了立即生效，不用重启；
+		// 也不能读 a.cfg，热重载后它和管理层手里的配置已是两个对象。
+		go func() {
+			// 启动后先查一次再进入周期循环。否则新装或刚重启的机器要空等
+			// 满一个周期才可能收到提醒，期间用户完全不知道
+			// 已有新版本。延迟 20 秒是为了让 Bot 与网络就绪，避免开机瞬间
+			// 查询失败白白浪费这一次。
+			wait := 20 * time.Second
+			var last time.Time
+			for {
+				select {
+				case <-botCtx.Done():
+					return
+				case <-time.After(wait):
 				}
-			}()
-		}
+				wait = time.Minute
+				check, _, ivh := mgr.UpdateSettings()
+				if !check || (!last.IsZero() && time.Since(last) < time.Duration(ivh)*time.Hour) {
+					continue
+				}
+				last = time.Now()
+				cctx, cancel := context.WithTimeout(botCtx, 60*time.Second)
+				has, rel, err := updater.HasUpdate(cctx)
+				cancel()
+				if err != nil || !has || mgr.IsIgnoredVersion(rel.Tag) || !updater.ShouldNotify(rel.Tag) {
+					continue
+				}
+				tb.NotifyAction(botCtx, fmt.Sprintf(
+					"\U0001F514 <b>发现新版本 %s</b>　当前 <code>%s</code>%s%s",
+					rel.Tag, version, nl2, htmlPre(rel.Notes, 800)),
+					"查看并升级", "update", "update")
+				if _, auto, _ := mgr.UpdateSettings(); auto {
+					actx, acancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					if out, aerr := updater.Apply(actx, rel.Tag); aerr == nil {
+						tb.Notify(botCtx, "\u2705 "+out)
+					} else {
+						tb.Notify(botCtx, "\u26A0\uFE0F 自动升级失败："+aerr.Error())
+					}
+					acancel()
+				}
+			}
+		}()
 
 		// 证书过期后 DoT 握手全部失败，健康页只有打开时才看得到，必须主动推送。
-		if health.Notify != nil && a.cfg.Gateway.CertFile != "" {
+		if a.cfg.Gateway.CertFile != "" {
 			cw := &certrenew.ExpiryWatcher{
 				CertFile:  a.cfg.Gateway.CertFile,
 				StateFile: certrenew.AlertStateFile,
-				Notify:    health.Notify,
+				Notify:    notify.Send,
 			}
 			go cw.Run(botCtx, 20*time.Second, 12*time.Hour)
 		}
@@ -1128,4 +1128,71 @@ func htmlPre(s string, limit int) string {
 	}
 	rep := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 	return "<pre>" + rep.Replace(s) + "</pre>"
+}
+
+// rulesetFailAlertAfter 是规则集连续检查失败多少次后告警。失败后每小时
+// 重试一次，单次失败多半只是网络抖动。
+const rulesetFailAlertAfter = 3
+
+// rulesetAlerts 根据最新检查状态生成告警与恢复通知，alerted 记录已告警的
+// 规则集，跨轮次复用。
+func rulesetAlerts(sets []config.RuleSetConfig, st map[string]ruleset.Status, alerted map[string]bool) []string {
+	var out []string
+	active := map[string]bool{}
+	for _, rs := range sets {
+		if rs.Path != "" || rs.URL == "" {
+			continue
+		}
+		active[rs.Name] = true
+		s := st[rs.Name]
+		switch {
+		case s.Fails >= rulesetFailAlertAfter && !alerted[rs.Name]:
+			alerted[rs.Name] = true
+			out = append(out, fmt.Sprintf(
+				"⚠️ <b>规则集 %s 更新失败</b>\n\n已连续 %d 次：%s\n\n%s",
+				html.EscapeString(rs.Name), s.Fails, html.EscapeString(s.LastError),
+				"仍在使用旧版本，广告拦截和分流规则可能滞后。可在「规则 → 规则集状态」查看。"))
+		case s.Fails == 0 && alerted[rs.Name]:
+			delete(alerted, rs.Name)
+			out = append(out, fmt.Sprintf("✅ <b>规则集 %s 已恢复更新</b>", html.EscapeString(rs.Name)))
+		}
+	}
+	for name := range alerted {
+		if !active[name] {
+			delete(alerted, name)
+		}
+	}
+	return out
+}
+
+// egressAlerts 返回出口告警的发送函数：每次发送时读取当前的告警开关。
+func egressAlerts(mgr *manage.Manager, hub *notifyHub) func(string) {
+	return func(text string) {
+		if _, _, disabled := mgr.MonitorSettings(); disabled {
+			return
+		}
+		hub.Send(text)
+	}
+}
+
+// notifyHub 是 Bot 推送通道。后台任务先于 Bot 启动，通道就绪前的
+// 消息直接丢弃（与未配置 Bot 时一致）。
+type notifyHub struct {
+	mu sync.RWMutex
+	fn func(string)
+}
+
+func (h *notifyHub) Set(fn func(string)) {
+	h.mu.Lock()
+	h.fn = fn
+	h.mu.Unlock()
+}
+
+func (h *notifyHub) Send(text string) {
+	h.mu.RLock()
+	fn := h.fn
+	h.mu.RUnlock()
+	if fn != nil {
+		fn(text)
+	}
 }

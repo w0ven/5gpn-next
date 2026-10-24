@@ -763,7 +763,7 @@ var prompts = map[string]struct{ icon, title, body, back string }{
 		"某个 App 被误拦（白屏、加载不出来）时，发送它的域名，例如 <code>example.com</code>。\n<i>连同子域名一起放行。</i>",
 		"ad_allow_list"},
 	"update_interval": {"settings", "检查间隔",
-		"发送 1-168 的小时数，例如 <code>1</code> 或 <code>6</code>。\n<i>下次重启起完全生效。</i>", "update_settings"},
+		"发送 1-168 的小时数，例如 <code>1</code> 或 <code>6</code>。", "update_settings"},
 }
 
 func (b *Bot) askFor(ctx context.Context, v view, action, errNote string) {

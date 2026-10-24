@@ -967,6 +967,13 @@ func (m *Manager) UpdateHistory(limit int) []update.TxResult {
 	return update.History(limit)
 }
 
+// EgressConfigs 返回出口配置副本。
+func (m *Manager) EgressConfigs() []config.EgressConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]config.EgressConfig(nil), m.Cfg.Egress...)
+}
+
 // MonitorSettings 返回告警设置（含默认值归一）。
 func (m *Manager) MonitorSettings() (alertAfter, cooldownMin int, disabled bool) {
 	m.mu.RLock()
@@ -1006,18 +1013,13 @@ func (m *Manager) SetMonitorAlerts(alertAfter, cooldownMin int, disabled *bool) 
 		return err
 	}
 	if m.Health != nil {
-		if m.Cfg.Monitor.AlertAfter > 0 {
-			m.Health.AlertAfter = m.Cfg.Monitor.AlertAfter
-		}
-		if m.Cfg.Monitor.AlertCooldownMinutes > 0 {
-			m.Health.AlertCooldown = time.Duration(m.Cfg.Monitor.AlertCooldownMinutes) * time.Minute
-		}
+		m.Health.SetAlertPolicy(m.Cfg.Monitor.AlertAfter,
+			time.Duration(m.Cfg.Monitor.AlertCooldownMinutes)*time.Minute)
 	}
 	return nil
 }
 
-// SetUpdateInterval 调整检查间隔（小时）并持久化。
-// 注意：运行中的检查循环用的是启动时读取的间隔，改动重启后完全生效。
+// SetUpdateInterval 调整检查间隔（小时）并持久化，检查循环每分钟读取一次。
 func (m *Manager) SetUpdateInterval(hours int) error {
 	if hours < 1 || hours > 168 {
 		return fmt.Errorf("间隔 %d 小时超出范围（1-168）", hours)

@@ -341,6 +341,18 @@ func (m *Monitor) probeOnce(ctx context.Context) {
 	wg.Wait()
 }
 
+// SetAlertPolicy 运行中调整告警阈值与冷却；零值表示不修改该项。
+func (m *Monitor) SetAlertPolicy(after int, cooldown time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if after > 0 {
+		m.AlertAfter = after
+	}
+	if cooldown > 0 {
+		m.AlertCooldown = cooldown
+	}
+}
+
 func (m *Monitor) alertAfter() int {
 	if m.AlertAfter > 0 {
 		return m.AlertAfter

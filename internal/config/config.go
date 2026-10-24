@@ -368,7 +368,7 @@ type RuleSetConfig struct {
 	Kind string `json:"kind"`
 	URL  string `json:"url,omitempty"`
 	Path string `json:"path,omitempty"`
-	// IntervalHours 为 0 时不自动更新
+	// IntervalHours 是自动更新间隔（小时）；不填或为 0 时按 24 小时，负数表示不自动更新。
 	IntervalHours int `json:"interval_hours,omitempty"`
 }
 
