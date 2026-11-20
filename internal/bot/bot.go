@@ -189,22 +189,34 @@ type update struct {
 	} `json:"callback_query"`
 }
 
+func (b *Bot) redactErr(err error) error {
+	if err == nil || b.Token == "" {
+		return err
+	}
+	msg := err.Error()
+	clean := strings.ReplaceAll(msg, b.Token, "<REDACTED>")
+	if clean == msg {
+		return err
+	}
+	return fmt.Errorf("%s", clean)
+}
+
 func (b *Bot) api(ctx context.Context, method string, params url.Values) ([]byte, error) {
 	endpoint := fmt.Sprintf("%s/bot%s/%s", b.apiBase, b.Token, method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint,
 		strings.NewReader(params.Encode()))
 	if err != nil {
-		return nil, err
+		return nil, b.redactErr(err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, b.redactErr(err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return nil, err
+		return nil, b.redactErr(err)
 	}
 	var r struct {
 		OK          bool            `json:"ok"`
@@ -435,26 +447,29 @@ func (b *Bot) EditMessage(ctx context.Context, chatID, msgID int64, text, keyboa
 }
 
 // Notify 主动推送给所有管理员，附「知道了」按钮。
-//
-// 若全部投递失败（常见于 Bot 刚创建、用户尚未 /start），
-// 标记待补发，等用户首次交互时再送出。
 func (b *Bot) Notify(ctx context.Context, text string) {
-	b.notify(ctx, text, inlineKeyboard([]btn{dismissBtn()}))
+	b.notify(ctx, text, inlineKeyboard([]btn{dismissBtn()}), false)
 }
 
 // NotifyAction 推送通知并附一个入口按钮：点击后该通知就地变成对应页面。
 func (b *Bot) NotifyAction(ctx context.Context, text, label, cmd, iconName string) {
-	b.notify(ctx, text, inlineKeyboard([]btn{{Text: label, Data: cmd, Icon: iconName}, dismissBtn()}))
+	b.notify(ctx, text, inlineKeyboard([]btn{{Text: label, Data: cmd, Icon: iconName}, dismissBtn()}), false)
 }
 
-func (b *Bot) notify(ctx context.Context, text, keyboard string) {
+// NotifyStartup 推送版本首次启动通知。若全部投递失败（常见于 Bot 刚创建、
+// 管理员尚未 /start），标记待补发，等管理员首次交互时再送出。
+func (b *Bot) NotifyStartup(ctx context.Context, text, label, cmd, iconName string) {
+	b.notify(ctx, text, inlineKeyboard([]btn{{Text: label, Data: cmd, Icon: iconName}, dismissBtn()}), true)
+}
+
+func (b *Bot) notify(ctx context.Context, text, keyboard string, isStartup bool) {
 	delivered := false
 	for _, id := range b.Admins {
 		if b.withDegrade(keyboard, func(kb string) int64 { return b.send(ctx, id, text, kb) }) != 0 {
 			delivered = true
 		}
 	}
-	if !delivered {
+	if !delivered && isStartup {
 		b.mu.Lock()
 		b.pendingGreet = true
 		b.mu.Unlock()
@@ -883,12 +898,12 @@ func (b *Bot) sendFile(ctx context.Context, method, field string, chatID int64, 
 	endpoint := fmt.Sprintf("%s/bot%s/%s", b.apiBase, b.Token, method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &buf)
 	if err != nil {
-		return 0, err
+		return 0, b.redactErr(err)
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, b.redactErr(err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

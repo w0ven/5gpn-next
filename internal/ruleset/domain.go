@@ -25,13 +25,15 @@ type DomainSet struct {
 }
 
 type node struct {
+	// children 懒分配：85%+ 节点为叶子节点（terminal=true 且无子域），
+	// 不为叶子预建空 map 可将 10 万级规则集的常驻堆与 GC 扫描对象砍掉大半。
 	children map[string]*node
 	// terminal 表示到此为止即构成一条后缀规则
 	terminal bool
 }
 
 func newNode() *node {
-	return &node{children: make(map[string]*node, 4)}
+	return &node{}
 }
 
 // NewDomainSet 返回空集合。
@@ -102,15 +104,24 @@ func (d *DomainSet) AddRule(raw string) {
 }
 
 func (d *DomainSet) addSuffix(host string) {
-	labels := strings.Split(host, ".")
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	cur := d.root
-	// 反向插入：com -> example
-	for i := len(labels) - 1; i >= 0; i-- {
-		l := labels[i]
+	// 反向插入：com -> example，按需为非叶节点创建 children map，且免去 strings.Split 切片分配。
+	for rem := host; rem != ""; {
+		var l string
+		if idx := strings.LastIndexByte(rem, '.'); idx >= 0 {
+			l = rem[idx+1:]
+			rem = rem[:idx]
+		} else {
+			l = rem
+			rem = ""
+		}
 		if l == "" {
 			continue
+		}
+		if cur.children == nil {
+			cur.children = make(map[string]*node)
 		}
 		next, ok := cur.children[l]
 		if !ok {
@@ -125,7 +136,7 @@ func (d *DomainSet) addSuffix(host string) {
 	}
 }
 
-// Match 判断 host 是否命中集合。
+// Match 判断 host 是否命中集合（热路径零堆分配）。
 func (d *DomainSet) Match(host string) bool {
 	h := normalizeHost(host)
 	if h == "" {
@@ -139,10 +150,20 @@ func (d *DomainSet) Match(host string) bool {
 		return true
 	}
 
-	labels := strings.Split(h, ".")
 	cur := d.root
-	for i := len(labels) - 1; i >= 0; i-- {
-		next, ok := cur.children[labels[i]]
+	for rem := h; rem != "" && cur != nil; {
+		var l string
+		if idx := strings.LastIndexByte(rem, '.'); idx >= 0 {
+			l = rem[idx+1:]
+			rem = rem[:idx]
+		} else {
+			l = rem
+			rem = ""
+		}
+		if l == "" {
+			continue
+		}
+		next, ok := cur.children[l]
 		if !ok {
 			break
 		}
@@ -162,6 +183,20 @@ func (d *DomainSet) Match(host string) bool {
 
 // normalizeHost 统一小写、去尾点、去端口、去 IPv6 方括号。
 func normalizeHost(s string) string {
+	// 快路径：已是去空白、去尾点、无括号的全小写字符串时直接零分配返回。
+	if s != "" && s[0] != '[' && s[len(s)-1] != '.' && s[len(s)-1] != ']' {
+		clean := true
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c <= ' ' || (c >= 'A' && c <= 'Z') || c >= 0x80 {
+				clean = false
+				break
+			}
+		}
+		if clean {
+			return s
+		}
+	}
 	h := strings.TrimSpace(strings.ToLower(s))
 	h = strings.TrimSuffix(h, ".")
 	h = strings.TrimPrefix(h, "[")

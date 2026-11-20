@@ -28,6 +28,7 @@ const (
 // 以下三段必须与 install.sh 写出的钩子逐字节一致，由测试校验。
 
 // PreHook 续期前临时放行公网 ACME；仅在仍有 standalone 续期时停服让出 :80。
+// 同时覆盖 inet fgpn 与前代遗留的 inet pdg 表（多 input 链时任一表 drop 都会让挑战超时）。
 const PreHook = `#!/bin/bash
 # 续期前把 ACME 临时放行插到公网兜底 drop 之前。网关自己在 :80 应答
 # webroot 挑战，不用停服；只有续期配置仍是 standalone（certbot 要自己
@@ -36,12 +37,14 @@ set -u
 STATE=/run/5gpn-next-cert-renew.state
 date +%s > /var/lib/5gpn-next/cert-renew-attempt 2>/dev/null || true
 rm_rules() {
-  local handle
-  while read -r handle; do
-    [ -n "$handle" ] || continue
-    nft delete rule inet fgpn input handle "$handle" 2>/dev/null || true
-  done < <(nft -a list chain inet fgpn input 2>/dev/null \
-    | awk '/comment "5gpn-acme-tmp"/ { for (i=1; i<=NF; i++) if ($i=="handle") print $(i+1) }')
+  local tbl handle
+  for tbl in fgpn pdg; do
+    while read -r handle; do
+      [ -n "$handle" ] || continue
+      nft delete rule inet "$tbl" input handle "$handle" 2>/dev/null || true
+    done < <(nft -a list chain inet "$tbl" input 2>/dev/null \
+      | awk '/comment "5gpn-acme-tmp"/ { for (i=1; i<=NF; i++) if ($i=="handle") print $(i+1) }')
+  done
 }
 rm_rules
 if grep -qsE '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*standalone' /etc/letsencrypt/renewal/*.conf \
@@ -51,13 +54,16 @@ if grep -qsE '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*standalone' /et
 else
   rm -f "$STATE"
 fi
-if nft list chain inet fgpn input >/dev/null 2>&1; then
-  if ! nft insert rule inet fgpn input tcp dport 80 accept comment '"5gpn-acme-tmp"'; then
-    [ -f "$STATE" ] && systemctl start 5gpn-next.service || true
-    rm -f "$STATE"
-    exit 1
+for tbl in fgpn pdg; do
+  if nft list chain inet "$tbl" input >/dev/null 2>&1; then
+    if ! nft insert rule inet "$tbl" input tcp dport 80 accept comment '"5gpn-acme-tmp"'; then
+      rm_rules
+      [ -f "$STATE" ] && systemctl start 5gpn-next.service || true
+      rm -f "$STATE"
+      exit 1
+    fi
   fi
-fi
+done
 exit 0
 `
 
@@ -67,11 +73,13 @@ const PostHook = `#!/bin/bash
 set -u
 STATE=/run/5gpn-next-cert-renew.state
 date +%s > /var/lib/5gpn-next/cert-renew-finished 2>/dev/null || true
-while read -r handle; do
-  [ -n "$handle" ] || continue
-  nft delete rule inet fgpn input handle "$handle" 2>/dev/null || true
-done < <(nft -a list chain inet fgpn input 2>/dev/null \
-  | awk '/comment "5gpn-acme-tmp"/ { for (i=1; i<=NF; i++) if ($i=="handle") print $(i+1) }')
+for tbl in fgpn pdg; do
+  while read -r handle; do
+    [ -n "$handle" ] || continue
+    nft delete rule inet "$tbl" input handle "$handle" 2>/dev/null || true
+  done < <(nft -a list chain inet "$tbl" input 2>/dev/null \
+    | awk '/comment "5gpn-acme-tmp"/ { for (i=1; i<=NF; i++) if ($i=="handle") print $(i+1) }')
+done
 if [ -f "$STATE" ]; then
   rm -f "$STATE"
   systemctl start 5gpn-next.service || true

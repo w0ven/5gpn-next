@@ -48,3 +48,17 @@ func TestRuleSetMemoryCost(t *testing.T) {
 	// 保持引用，避免被提前回收导致测量失真
 	runtime.KeepAlive(ds)
 }
+
+func BenchmarkDomainSetMatch110k(b *testing.B) {
+	ds := NewDomainSet()
+	for i := 0; i < 110000; i++ {
+		ds.AddRule(fmt.Sprintf("sub%d.example%d.com", i, i%5000))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !ds.Match("api.sub1024.example1024.com") {
+			b.Fatal("expected hit")
+		}
+	}
+}

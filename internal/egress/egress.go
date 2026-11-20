@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -182,7 +183,10 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (net.Con
 	if err != nil {
 		return nil, fmt.Errorf("连接 SOCKS5 上游 %s 失败: %w", s.addr, err)
 	}
-	if err := socks5Handshake(c, addr); err != nil {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+	if err := socks5Handshake(ctx, c, addr); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -210,58 +214,73 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (net.Con
 }
 
 // socks5Handshake 执行无认证 SOCKS5 CONNECT。
-func socks5Handshake(c net.Conn, target string) error {
+func socks5Handshake(ctx context.Context, c net.Conn, target string) error {
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
 		return fmt.Errorf("目标 %q 格式错误: %w", target, err)
 	}
-	port, err := net.LookupPort("tcp", portStr)
-	if err != nil {
-		return fmt.Errorf("端口 %q 无效: %w", portStr, err)
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		port, err = net.LookupPort("tcp", portStr)
+		if err != nil {
+			return fmt.Errorf("端口 %q 无效: %w", portStr, err)
+		}
 	}
-	_ = c.SetDeadline(time.Now().Add(DialTimeout))
+	deadline := time.Now().Add(DialTimeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	_ = c.SetDeadline(deadline)
 	defer c.SetDeadline(time.Time{})
 
 	// 1) 方法协商：仅 NO AUTH
 	if _, err := c.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 		return err
 	}
-	rep := make([]byte, 2)
-	if _, err := readFull(c, rep); err != nil {
+	var rep [2]byte
+	if _, err := readFull(c, rep[:]); err != nil {
 		return err
 	}
 	if rep[0] != 0x05 || rep[1] != 0x00 {
 		return fmt.Errorf("SOCKS5 方法协商失败: %v", rep)
 	}
 
-	// 2) CONNECT 请求
-	req := []byte{0x05, 0x01, 0x00}
+	// 2) CONNECT 请求（栈上缓冲，免小切片堆分配）
+	var reqBuf [262]byte
+	reqBuf[0], reqBuf[1], reqBuf[2] = 0x05, 0x01, 0x00
+	reqLen := 3
 	if ip, err := netip.ParseAddr(host); err == nil {
 		ip = ip.Unmap()
 		if ip.Is4() {
 			a := ip.As4()
-			req = append(req, 0x01)
-			req = append(req, a[:]...)
+			reqBuf[reqLen] = 0x01
+			copy(reqBuf[reqLen+1:], a[:])
+			reqLen += 1 + 4
 		} else {
 			a := ip.As16()
-			req = append(req, 0x04)
-			req = append(req, a[:]...)
+			reqBuf[reqLen] = 0x04
+			copy(reqBuf[reqLen+1:], a[:])
+			reqLen += 1 + 16
 		}
 	} else {
 		if len(host) > 255 {
 			return fmt.Errorf("域名过长: %d", len(host))
 		}
-		req = append(req, 0x03, byte(len(host)))
-		req = append(req, host...)
+		reqBuf[reqLen] = 0x03
+		reqBuf[reqLen+1] = byte(len(host))
+		copy(reqBuf[reqLen+2:], host)
+		reqLen += 2 + len(host)
 	}
-	req = append(req, byte(port>>8), byte(port))
-	if _, err := c.Write(req); err != nil {
+	reqBuf[reqLen] = byte(port >> 8)
+	reqBuf[reqLen+1] = byte(port)
+	reqLen += 2
+	if _, err := c.Write(reqBuf[:reqLen]); err != nil {
 		return err
 	}
 
 	// 3) 响应
-	head := make([]byte, 4)
-	if _, err := readFull(c, head); err != nil {
+	var head [4]byte
+	if _, err := readFull(c, head[:]); err != nil {
 		return err
 	}
 	if head[1] != 0x00 {
@@ -274,15 +293,16 @@ func socks5Handshake(c net.Conn, target string) error {
 	case 0x04:
 		skip = 16 + 2
 	case 0x03:
-		l := make([]byte, 1)
-		if _, err := readFull(c, l); err != nil {
+		var l [1]byte
+		if _, err := readFull(c, l[:]); err != nil {
 			return err
 		}
 		skip = int(l[0]) + 2
 	default:
 		return fmt.Errorf("SOCKS5 未知地址类型 0x%02x", head[3])
 	}
-	if _, err := readFull(c, make([]byte, skip)); err != nil {
+	var skipBuf [258]byte
+	if _, err := readFull(c, skipBuf[:skip]); err != nil {
 		return err
 	}
 	return nil

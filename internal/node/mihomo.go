@@ -34,9 +34,31 @@ func (n *Node) MihomoConfig(socksPort int) (string, error) {
 	b.WriteString(proxy)
 	b.WriteString("\nproxy-groups:\n")
 	b.WriteString("  - name: \"PROXY\"\n    type: select\n    proxies:\n      - \"node\"\n")
-	b.WriteString("\nrules:\n  - MATCH,PROXY\n")
+	b.WriteString(PrivateRejectRules)
 	return b.String(), nil
 }
+
+// PrivateRejectRules 阻断经 mihomo 出口代拨裸私网/回环/链路本地/云元数据 IP。
+//
+// 必须带 no-resolve：mihomo 运行在大陆入口网关本机，若不加 no-resolve，
+// 遇到任何域名都会先调用本机系统 DNS 解析，既增加延迟又会被 GFW 抢答的
+// 127.0.0.1 / 0.0.0.0 毒丸地址误触发 REJECT 导致境外网站大面积断连。
+const PrivateRejectRules = `
+rules:
+  - IP-CIDR,0.0.0.0/8,REJECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,REJECT,no-resolve
+  - IP-CIDR,100.64.0.0/10,REJECT,no-resolve
+  - IP-CIDR,127.0.0.0/8,REJECT,no-resolve
+  - IP-CIDR,169.254.0.0/16,REJECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,REJECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,REJECT,no-resolve
+  - IP-CIDR,224.0.0.0/4,REJECT,no-resolve
+  - IP-CIDR,240.0.0.0/4,REJECT,no-resolve
+  - IP-CIDR6,::1/128,REJECT,no-resolve
+  - IP-CIDR6,fc00::/7,REJECT,no-resolve
+  - IP-CIDR6,fe80::/10,REJECT,no-resolve
+  - MATCH,PROXY
+`
 
 // mihomoProxy 渲染单个 proxies 条目。出口名固定为 ASCII 的 node，
 // 避免节点名含 emoji 或空格时在 YAML 与配置引用中出问题。

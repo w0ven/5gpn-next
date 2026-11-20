@@ -1316,8 +1316,9 @@ func stopUnit(unit string) error {
 	return err
 }
 
-// StripMihomoController 去掉旧版生成的 mihomo 配置里的控制接口并重启
-// 对应实例。控制接口没有任何调用方，却以 root 身份无密码监听回环。
+// StripMihomoController 去掉旧版生成的 mihomo 配置里的控制接口、补齐落地私网
+// REJECT 防护规则，并重启发生变更的实例。控制接口没有任何调用方，却以 root 身份
+// 无密码监听回环；私网规则阻止借恶意域名重绑定访问落地机内网或云元数据。
 // 返回被重启的实例名。
 func (m *Manager) StripMihomoController() []string {
 	m.mu.RLock()
@@ -1343,11 +1344,16 @@ func (m *Manager) StripMihomoController() []string {
 			kept = append(kept, line)
 		}
 		out := strings.Join(kept, "\n")
+		// 旧版配置只有 "rules:\n  - MATCH,PROXY"：幂等升级为带 no-resolve 私网 REJECT 的完整段。
+		const bareRules = "\nrules:\n  - MATCH,PROXY\n"
+		if strings.Contains(out, bareRules) && !strings.Contains(out, "169.254.0.0/16,REJECT,no-resolve") {
+			out = strings.Replace(out, bareRules, node.PrivateRejectRules, 1)
+		}
 		if out == string(b) {
 			return
 		}
 		if err := write([]byte(out)); err != nil {
-			log.Printf("去除 %s 的控制接口失败: %v", path, err)
+			log.Printf("更新 %s 的安全配置失败: %v", path, err)
 			return
 		}
 		if err := systemctl("try-restart", unit); err != nil {

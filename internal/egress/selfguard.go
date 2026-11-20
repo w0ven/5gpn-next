@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -56,9 +57,24 @@ func IsPublicAddr(ip netip.Addr) bool {
 	return true
 }
 
-// guardPublicLiteral 在拨号前拦下 IP 字面量形式的非公网目标。
-// 域名目标经 DIRECT 解析后由 guardResolved 再查；经 SOCKS5 时由节点
-// 远端解析，落不到网关本机。
+// isNonPublicHostname 拦截明确指向本机、局域网或云厂商元数据服务的保留域名，
+// 防止客户端借外部 SOCKS5 节点远端解析访问落地机自身或云元数据。
+func isNonPublicHostname(host string) bool {
+	h := normalizeHost(host)
+	if h == "" {
+		return true
+	}
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") ||
+		strings.HasSuffix(h, ".local") || strings.HasSuffix(h, ".internal") ||
+		h == "instance-data" {
+		return true
+	}
+	return false
+}
+
+// guardPublicLiteral 在拨号前拦下 IP 字面量与保留本地/元数据主机名形式的非公网目标。
+// 域名目标经 DIRECT 解析后由 guardResolved 再查；经托管 mihomo 时还由落地侧
+// IP-CIDR REJECT 规则拦截 DNS 重绑定到私网/回环/元数据的情况。
 func guardPublicLiteral(ctx context.Context, addr string) error {
 	if !isPublicOnly(ctx) {
 		return nil
@@ -67,19 +83,20 @@ func guardPublicLiteral(ctx context.Context, addr string) error {
 	if err != nil {
 		return nil
 	}
-	if ip, err := netip.ParseAddr(host); err == nil && !IsPublicAddr(ip) {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !IsPublicAddr(ip) {
+			return ErrNonPublicTarget
+		}
+		return nil
+	}
+	if isNonPublicHostname(host) {
 		return ErrNonPublicTarget
 	}
 	return nil
 }
 
-// 接管端口：DoT 改写把域名指向网关 IP，客户端流量因而落到这些端口。
+// 接管端口为 80 / 443 / 853：DoT 改写把域名指向网关 IP，客户端流量因而落到这些端口。
 // 若出站再连回同一 IP 的同一端口，就会自己连自己。
-var takeoverPorts = map[int]struct{}{
-	80:  {},
-	443: {},
-	853: {},
-}
 
 var (
 	selfMu   sync.RWMutex
@@ -139,11 +156,16 @@ func IsSelfTakeover(addr string) bool {
 	if err != nil {
 		return false
 	}
-	port, err := net.LookupPort("tcp", portStr)
+	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return false
+		port, err = net.LookupPort("tcp", portStr)
+		if err != nil {
+			return false
+		}
 	}
-	if _, hit := takeoverPorts[port]; !hit {
+	switch port {
+	case 80, 443, 853:
+	default:
 		return false
 	}
 

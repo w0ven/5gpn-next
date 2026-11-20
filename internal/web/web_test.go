@@ -420,4 +420,16 @@ func TestWritesRequireLogin(t *testing.T) {
 	if again.Code != http.StatusForbidden {
 		t.Fatalf("同一链接第二次应失效: %d", again.Code)
 	}
+
+	index := httptest.NewRecorder()
+	h.ServeHTTP(index, httptest.NewRequest(http.MethodGet, "/", nil))
+	if index.Code != http.StatusOK {
+		t.Fatalf("首页状态码=%d", index.Code)
+	}
+	if csp := index.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'self'") {
+		t.Fatalf("缺少 CSP 头: %q", csp)
+	}
+	if xfo := index.Header().Get("X-Frame-Options"); xfo != "DENY" {
+		t.Fatalf("缺少 X-Frame-Options: %q", xfo)
+	}
 }

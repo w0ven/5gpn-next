@@ -254,3 +254,19 @@ func TestIsPublicAddr(t *testing.T) {
 		}
 	}
 }
+
+func TestSocks5PublicOnlyBlocksLocalAndMetadataHostnames(t *testing.T) {
+	s := NewSocks5("jp", "127.0.0.1:1", false)
+	ctx := PublicOnly(context.Background())
+	for _, target := range []string{
+		"localhost:80",
+		"api.localhost:443",
+		"nas.local:8080",
+		"metadata.google.internal:80",
+		"instance-data:80",
+	} {
+		if _, err := s.DialContext(ctx, "tcp", target); !errors.Is(err, ErrNonPublicTarget) {
+			t.Fatalf("%s: err=%v, 期望 ErrNonPublicTarget", target, err)
+		}
+	}
+}

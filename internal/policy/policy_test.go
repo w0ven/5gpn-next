@@ -178,3 +178,48 @@ func TestResolveCacheIsBounded(t *testing.T) {
 		t.Fatalf("resolver cache was not pruned: %d", n)
 	}
 }
+
+func TestMatchDomainShortCircuitAndUserIPPrecedence(t *testing.T) {
+	e := newTestEngine(t)
+
+	// 在 GEOIP 之前的域名规则（顶部只有私网 IP-CIDR）可直接短路，无需 DNS 解析。
+	if dec, ok := e.MatchDomainShortCircuit(TargetFromHostPort("api.weibo.com", 443)); !ok || dec.Action != ActionDirect {
+		t.Fatalf("expected domain short-circuit for weibo.com, got ok=%v dec=%+v", ok, dec)
+	}
+	if dec, ok := e.MatchDomainShortCircuit(TargetFromHostPort("ads.example.com", 443)); !ok || dec.Action != ActionBlock {
+		t.Fatalf("expected domain short-circuit for ads.example.com, got ok=%v dec=%+v", ok, dec)
+	}
+	// 位于 GEOIP,cn 之后的规则不得越过前面的 GEOIP 短路，严格保证 first-match 顺序。
+	if _, ok := e.MatchDomainShortCircuit(TargetFromHostPort("chat.openai.com", 443)); ok {
+		t.Fatal("rule after GEOIP must not bypass GEOIP via short-circuit")
+	}
+	// 未命中任何域名规则的未知域名不可短路（仍需查 GEOIP,cn）。
+	if _, ok := e.MatchDomainShortCircuit(TargetFromHostPort("unknown.io", 443)); ok {
+		t.Fatal("unknown domain must not short-circuit before GEOIP")
+	}
+
+	// 若用户在域名规则前配置了公网 IP-CIDR，不可跳过 DNS 解析。
+	e2 := New()
+	_ = e2.AddRule(Rule{Kind: KindIPCIDR, Value: "8.8.8.0/24", Action: ActionProxy, Egress: "att"})
+	_ = e2.AddRule(Rule{Kind: KindDomainSuffix, Value: "google.com", Action: ActionProxy, Egress: "jp"})
+	if _, ok := e2.MatchDomainShortCircuit(TargetFromHostPort("dns.google.com", 443)); ok {
+		t.Fatal("must not short-circuit across preceding public IP-CIDR rule")
+	}
+}
+
+func BenchmarkPolicyMatchDomainShortCircuit(b *testing.B) {
+	e := New()
+	_ = e.AddRule(Rule{Kind: KindIPCIDR, Value: "10.0.0.0/8", Action: ActionDirect})
+	_ = e.AddRule(Rule{Kind: KindIPCIDR, Value: "127.0.0.0/8", Action: ActionDirect})
+	_ = e.AddRule(Rule{Kind: KindDomainSuffix, Value: "ads.example.com", Action: ActionBlock})
+	_ = e.AddRule(Rule{Kind: KindDomainSuffix, Value: "openai.com", Action: ActionProxy, Egress: "us-1"})
+	tgt := TargetFromHostPort("chat.openai.com", 443)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dec, ok := e.MatchDomainShortCircuit(tgt)
+		if !ok || dec.Action != ActionProxy {
+			b.Fatal("unexpected decision")
+		}
+	}
+}

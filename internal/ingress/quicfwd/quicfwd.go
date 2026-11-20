@@ -60,6 +60,19 @@ const (
 	maxPendingBytes = 32 << 10
 )
 
+var datagramBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, maxDatagram)
+		return &b
+	},
+}
+
+type establishedRelay struct {
+	conn   net.Conn
+	host   string
+	egress string
+}
+
 // Recorder 接收连接决策记录。
 type Recorder interface{ Record(t *trace.Trace) }
 
@@ -132,6 +145,7 @@ type session struct {
 	lastSeen atomic.Int64 // UnixNano
 	up       atomic.Int64
 	down     atomic.Int64
+	fast     atomic.Pointer[establishedRelay]
 }
 
 // ListenAndServe 在 addr 上接管 QUIC 流量，直到 ctx 结束。
@@ -155,6 +169,13 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	}()
 	go s.janitor(ctx)
 
+	listenPort := 443
+	if _, portStr, err := net.SplitHostPort(pc.LocalAddr().String()); err == nil {
+		if p, err := net.LookupPort("udp", portStr); err == nil && p > 0 {
+			listenPort = p
+		}
+	}
+
 	log.Printf("QUIC 接管入口已启动 %s（Initial SNI 解析）", addr)
 
 	buf := make([]byte, maxDatagram)
@@ -172,9 +193,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		if !s.allowedClient(raddr) {
 			continue
 		}
-		dg := make([]byte, n)
-		copy(dg, buf[:n])
-		s.dispatch(ctx, pc, raddr, dg)
+		s.dispatchPort(ctx, pc, listenPort, raddr, buf[:n])
 	}
 }
 
@@ -193,8 +212,24 @@ func (s *Server) allowedClient(a net.Addr) bool {
 	return s.ClientCIDR.Contains(ip.Unmap())
 }
 
-// dispatch 把数据报交给对应会话；必要时新建会话。read 循环不得阻塞。
+// dispatch 兼容同包单测调用：从 pc.LocalAddr() 推导端口后分发。
 func (s *Server) dispatch(ctx context.Context, pc net.PacketConn, raddr net.Addr, dg []byte) {
+	listenPort := 443
+	if pc != nil && pc.LocalAddr() != nil {
+		if ua, ok := pc.LocalAddr().(*net.UDPAddr); ok && ua.Port > 0 {
+			listenPort = ua.Port
+		} else if _, portStr, err := net.SplitHostPort(pc.LocalAddr().String()); err == nil {
+			if p, err := net.LookupPort("udp", portStr); err == nil && p > 0 {
+				listenPort = p
+			}
+		}
+	}
+	s.dispatchPort(ctx, pc, listenPort, raddr, dg)
+}
+
+// dispatchPort 把数据报交给对应会话；必要时新建会话。read 循环不得阻塞。
+// dg 指向收包循环复用缓冲：仅在需要进 pending 队列时拷贝，稳定转发态零分配。
+func (s *Server) dispatchPort(ctx context.Context, pc net.PacketConn, listenPort int, raddr net.Addr, dg []byte) {
 	key := raddr.String()
 
 	s.mu.Lock()
@@ -210,18 +245,13 @@ func (s *Server) dispatch(ctx context.Context, pc net.PacketConn, raddr net.Addr
 			s.mu.Unlock()
 			return
 		}
-		_, port, _ := net.SplitHostPort(pc.LocalAddr().String())
-		p, _ := net.LookupPort("udp", port)
-		if p == 0 {
-			p = 443
-		}
-		host, _, _ := net.SplitHostPort(key)
+		host := clientIPOfAddr(raddr, key)
 		sess = &session{
 			srv:      s,
 			key:      key,
 			client:   raddr,
 			clientIP: host,
-			port:     p,
+			port:     listenPort,
 			dec:      quicsni.NewDecoder(),
 			tr:       trace.New(idFor(s.seq.Add(1)), "quic://pending", host),
 		}
@@ -230,7 +260,27 @@ func (s *Server) dispatch(ctx context.Context, pc net.PacketConn, raddr net.Addr
 	s.mu.Unlock()
 
 	sess.lastSeen.Store(time.Now().UnixNano())
-	sess.onDatagram(ctx, pc, dg)
+	// 已建立中继且 pending 已清空的会话走无锁零拷贝快路径。
+	if r := sess.fast.Load(); r != nil {
+		if n, _ := r.conn.Write(dg); n > 0 {
+			sess.up.Add(int64(n))
+			sess.reportTrafficFast(r.host, r.egress, int64(n), 0)
+		}
+		return
+	}
+	copied := make([]byte, len(dg))
+	copy(copied, dg)
+	sess.onDatagram(ctx, pc, copied)
+}
+
+func clientIPOfAddr(a net.Addr, fallbackKey string) string {
+	if ua, ok := a.(*net.UDPAddr); ok {
+		if ip, ok := netip.AddrFromSlice(ua.IP); ok {
+			return ip.Unmap().String()
+		}
+	}
+	host, _, _ := net.SplitHostPort(fallbackKey)
+	return host
 }
 
 func idFor(n uint64) string {
@@ -250,11 +300,12 @@ func (sc *session) onDatagram(ctx context.Context, pc net.PacketConn, dg []byte)
 	if sc.remote != nil {
 		remote := sc.remote
 		host := sc.host
+		eg := sc.egress
 		sc.mu.Unlock()
 		n, _ := remote.Write(dg)
 		if n > 0 {
 			sc.up.Add(int64(n))
-			sc.reportTraffic(host, int64(n), 0)
+			sc.reportTrafficFast(host, eg, int64(n), 0)
 		}
 		return
 	}
@@ -324,7 +375,7 @@ func (sc *session) connect(ctx context.Context, pc net.PacketConn, host string) 
 	sc.tr.Target = target
 	sc.tr.Step(trace.StageIngress, trace.StatusOK, "QUIC Initial SNI 解析成功")
 
-	t, _ := policy.ParseTarget(target)
+	t := policy.TargetFromHostPort(host, sc.port)
 	dec := sc.srv.Policy().MatchContext(ctx, t)
 	actionName := statsAction(dec.Action)
 
@@ -373,20 +424,17 @@ func (sc *session) connect(ctx context.Context, pc net.PacketConn, host string) 
 	}
 	sc.tr.Step(trace.StageConnect, trace.StatusOK, "UDP 会话 %s 已建立", remote.RemoteAddr())
 
+	egName := d.Name()
 	sc.mu.Lock()
 	if sc.closed {
 		sc.mu.Unlock()
 		_ = remote.Close()
 		return
 	}
-	sc.remote = remote
 	sc.action = actionName
-	sc.egress = d.Name()
+	sc.egress = egName
 	reportConn := !sc.counted
 	sc.counted = true
-	pending := sc.pending
-	sc.pending = nil
-	sc.pendingBytes = 0
 	sc.mu.Unlock()
 
 	if reportConn && sc.srv.OnConn != nil {
@@ -394,24 +442,54 @@ func (sc *session) connect(ctx context.Context, pc net.PacketConn, host string) 
 	}
 	sc.srv.Handled.Add(1)
 
-	// 补发握手期间缓冲的数据报，顺序与到达顺序一致。
-	for _, dg := range pending {
-		n, err := remote.Write(dg)
-		if n > 0 {
-			sc.up.Add(int64(n))
-			sc.reportTraffic(host, int64(n), 0)
+	// 按序冲刷握手期间缓冲的数据报；冲刷期间保持 sc.resolving=true、sc.remote=nil，
+	// 防止并发到达的新包插队乱序。清空后在同一临界区内发布 remote 与无锁快路径。
+	for {
+		sc.mu.Lock()
+		if sc.closed {
+			sc.mu.Unlock()
+			_ = remote.Close()
+			return
 		}
-		if err != nil {
+		if len(sc.pending) == 0 {
+			sc.remote = remote
+			sc.resolving = false
+			sc.fast.Store(&establishedRelay{conn: remote, host: host, egress: egName})
+			sc.mu.Unlock()
 			break
+		}
+		batch := sc.pending
+		sc.pending = nil
+		sc.pendingBytes = 0
+		sc.mu.Unlock()
+
+		var writeErr error
+		for _, dg := range batch {
+			n, err := remote.Write(dg)
+			if n > 0 {
+				sc.up.Add(int64(n))
+				sc.reportTrafficFast(host, egName, int64(n), 0)
+			}
+			if err != nil {
+				writeErr = err
+				break
+			}
+		}
+		if writeErr != nil {
+			_ = remote.Close()
+			sc.finish(host, actionName, false)
+			return
 		}
 	}
 
-	go sc.pump(pc, remote, host, actionName)
+	go sc.pump(pc, remote, host, egName, actionName)
 }
 
 // pump 把出口返回的数据报回送给客户端。
-func (sc *session) pump(pc net.PacketConn, remote net.Conn, host, action string) {
-	buf := make([]byte, maxDatagram)
+func (sc *session) pump(pc net.PacketConn, remote net.Conn, host, egName, action string) {
+	bufp := datagramBufPool.Get().(*[]byte)
+	buf := *bufp
+	defer datagramBufPool.Put(bufp)
 	for {
 		_ = remote.SetReadDeadline(time.Now().Add(idleTimeout))
 		n, err := remote.Read(buf)
@@ -420,7 +498,7 @@ func (sc *session) pump(pc net.PacketConn, remote net.Conn, host, action string)
 			written, werr := pc.WriteTo(buf[:n], sc.client)
 			if written > 0 {
 				sc.down.Add(int64(written))
-				sc.reportTraffic(host, 0, int64(written))
+				sc.reportTrafficFast(host, egName, 0, int64(written))
 			}
 			if werr != nil {
 				break
@@ -463,6 +541,7 @@ func (sc *session) finish(host, action string, failed bool) {
 	remote := sc.remote
 	sc.remote = nil
 	sc.pending = nil
+	sc.fast.Store(nil)
 	sc.mu.Unlock()
 
 	if remote != nil {
@@ -481,19 +560,26 @@ func (sc *session) finish(host, action string, failed bool) {
 }
 
 func (sc *session) reportTraffic(host string, up, down int64) {
+	var eg string
+	if r := sc.fast.Load(); r != nil {
+		eg = r.egress
+	} else {
+		sc.mu.Lock()
+		eg = sc.egress
+		sc.mu.Unlock()
+	}
+	sc.reportTrafficFast(host, eg, up, down)
+}
+
+func (sc *session) reportTrafficFast(host, eg string, up, down int64) {
 	if up <= 0 && down <= 0 {
 		return
 	}
 	if sc.srv.OnTraffic != nil {
 		sc.srv.OnTraffic(host, up, down)
 	}
-	if sc.srv.OnEgressTraffic != nil {
-		sc.mu.Lock()
-		eg := sc.egress
-		sc.mu.Unlock()
-		if eg != "" {
-			sc.srv.OnEgressTraffic(eg, up, down)
-		}
+	if sc.srv.OnEgressTraffic != nil && eg != "" {
+		sc.srv.OnEgressTraffic(eg, up, down)
 	}
 }
 
