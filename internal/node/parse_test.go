@@ -179,4 +179,14 @@ func TestMihomoConfigEscapesEveryString(t *testing.T) {
 	if !strings.Contains(y, `servername: "a.com\x0alisteners:"`) {
 		t.Fatalf("servername 未转义:\n%s", y)
 	}
+	for _, rejectRule := range []string{
+		"IP-CIDR,127.0.0.0/8,REJECT,no-resolve",
+		"IP-CIDR,169.254.0.0/16,REJECT,no-resolve",
+		"IP-CIDR,10.0.0.0/8,REJECT,no-resolve",
+		"IP-CIDR6,fc00::/7,REJECT,no-resolve",
+	} {
+		if !strings.Contains(y, rejectRule) {
+			t.Fatalf("mihomo 配置缺少防重绑定内网拒绝规则 %q:\n%s", rejectRule, y)
+		}
+	}
 }

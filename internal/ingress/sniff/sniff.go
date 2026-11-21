@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,6 +55,18 @@ type TrafficStat func(host string, up, down int64)
 // 实际远低于此（多数连接不会同时用满缓冲）。超限时直接关闭新连接，
 // 客户端会自行重试，好过把整个网关拖进 OOM。
 const maxConns = 1024
+
+var (
+	peekReaderPool = sync.Pool{
+		New: func() any { return bufio.NewReaderSize(nil, 8*1024) },
+	}
+	relayBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 32*1024)
+			return &b
+		},
+	}
+)
 
 // Server 是 SNI/Host 嗅探接管服务。
 type Server struct {
@@ -200,11 +213,22 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string, isTLS bool) er
 func (s *Server) handle(ctx context.Context, cli net.Conn, isTLS bool) {
 	defer cli.Close()
 
-	id := fmt.Sprintf("s%d", s.seq.Add(1))
+	id := "s" + strconv.FormatUint(s.seq.Add(1), 10)
 	_ = cli.SetReadDeadline(time.Now().Add(8 * time.Second))
 
 	client := clientIP(cli.RemoteAddr())
-	br := bufio.NewReaderSize(cli, 8*1024)
+	br := peekReaderPool.Get().(*bufio.Reader)
+	br.Reset(cli)
+	brReleased := false
+	releaseReader := func() {
+		if !brReleased {
+			brReleased = true
+			br.Reset(nil)
+			peekReaderPool.Put(br)
+		}
+	}
+	defer releaseReader()
+
 	host, port, err := peekHost(br, isTLS)
 	hinted := false
 	if err != nil {
@@ -242,7 +266,7 @@ func (s *Server) handle(ctx context.Context, cli net.Conn, isTLS bool) {
 	}
 
 	// 策略判定
-	t, _ := policy.ParseTarget(target)
+	t := policy.TargetFromHostPort(host, port)
 	dec := s.Policy().MatchContext(ctx, t)
 
 	var actionName string
@@ -297,40 +321,73 @@ func (s *Server) handle(ctx context.Context, cli net.Conn, isTLS bool) {
 	}
 	tr.Step(trace.StageConnect, trace.StatusOK, "TCP %s 已建立", up.RemoteAddr())
 
-	// 双向转发；br 中已读出的首包（含无法解析的私有协议字节）需要一并送出
+	// 双向转发；先把 br 中已窥探的首包送出并立即归还 8KB 缓冲到池，
+	// 随后长连接生命周期内不再占用额外的 Reader 内存，并用池化 32KB 缓冲转发。
 	var upN, downN int64
 	egressName := dialer.Name()
+	hasTrafficHook := s.OnTraffic != nil || s.OnEgressTraffic != nil
+	reportUp := func(n int64) {
+		if n <= 0 {
+			return
+		}
+		if s.OnTraffic != nil {
+			s.OnTraffic(host, n, 0)
+		}
+		if s.OnEgressTraffic != nil {
+			s.OnEgressTraffic(egressName, n, 0)
+		}
+	}
+	reportDown := func(n int64) {
+		if n <= 0 {
+			return
+		}
+		if s.OnTraffic != nil {
+			s.OnTraffic(host, 0, n)
+		}
+		if s.OnEgressTraffic != nil {
+			s.OnEgressTraffic(egressName, 0, n)
+		}
+	}
+
+	if buffered := br.Buffered(); buffered > 0 {
+		head, _ := br.Peek(buffered)
+		if len(head) > 0 {
+			n, werr := up.Write(head)
+			if n > 0 {
+				atomic.AddInt64(&upN, int64(n))
+				if hasTrafficHook {
+					reportUp(int64(n))
+				}
+			}
+			if werr != nil {
+				tr.Fail(trace.StageApp, werr, "发送首包失败 up=%dB", upN)
+				return
+			}
+		}
+	}
+	releaseReader()
+
 	done := make(chan struct{}, 2)
 	go func() {
 		dst := io.Writer(up)
-		if s.OnTraffic != nil || s.OnEgressTraffic != nil {
-			dst = trafficWriter{dst: up, report: func(n int64) {
-				if s.OnTraffic != nil {
-					s.OnTraffic(host, n, 0)
-				}
-				if s.OnEgressTraffic != nil {
-					s.OnEgressTraffic(egressName, n, 0)
-				}
-			}}
+		if hasTrafficHook {
+			dst = trafficWriter{dst: up, report: reportUp}
 		}
-		n, _ := io.Copy(dst, br)
+		bufp := relayBufPool.Get().(*[]byte)
+		n, _ := io.CopyBuffer(dst, cli, *bufp)
+		relayBufPool.Put(bufp)
 		atomic.AddInt64(&upN, n)
 		closeWrite(up)
 		done <- struct{}{}
 	}()
 	go func() {
 		dst := io.Writer(cli)
-		if s.OnTraffic != nil || s.OnEgressTraffic != nil {
-			dst = trafficWriter{dst: cli, report: func(n int64) {
-				if s.OnTraffic != nil {
-					s.OnTraffic(host, 0, n)
-				}
-				if s.OnEgressTraffic != nil {
-					s.OnEgressTraffic(egressName, 0, n)
-				}
-			}}
+		if hasTrafficHook {
+			dst = trafficWriter{dst: cli, report: reportDown}
 		}
-		n, _ := io.Copy(dst, up)
+		bufp := relayBufPool.Get().(*[]byte)
+		n, _ := io.CopyBuffer(dst, up, *bufp)
+		relayBufPool.Put(bufp)
 		atomic.AddInt64(&downN, n)
 		closeWrite(cli)
 		done <- struct{}{}
@@ -568,6 +625,16 @@ func closeWrite(c io.Closer) {
 }
 
 func clientIP(a net.Addr) string {
+	switch v := a.(type) {
+	case *net.TCPAddr:
+		if ip, ok := netip.AddrFromSlice(v.IP); ok {
+			return ip.Unmap().String()
+		}
+	case *net.UDPAddr:
+		if ip, ok := netip.AddrFromSlice(v.IP); ok {
+			return ip.Unmap().String()
+		}
+	}
 	if h, _, err := net.SplitHostPort(a.String()); err == nil {
 		return h
 	}

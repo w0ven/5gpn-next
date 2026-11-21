@@ -17,6 +17,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -63,8 +64,16 @@ type Server struct {
 	client   *dns.Client
 	cacheMu  sync.RWMutex
 	cache    map[string]cacheEntry
+	flightMu sync.Mutex
+	flights  map[string]*inflightDNS
 	stopOnce sync.Once
 	srvTCP   *dns.Server
+}
+
+type inflightDNS struct {
+	done chan struct{}
+	resp *dns.Msg
+	err  error
 }
 
 type cacheEntry struct {
@@ -81,6 +90,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		s.Upstream = []string{"223.5.5.5:53", "119.29.29.29:53"}
 	}
 	s.cache = make(map[string]cacheEntry)
+	s.flights = make(map[string]*inflightDNS)
 	s.client = &dns.Client{Net: "udp", Timeout: 4 * time.Second}
 
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: s.GetCertificate}
@@ -173,14 +183,28 @@ func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	// 先向国内 DNS 上游解析真实 A 记录，再把目标 IP 交给 GEOIP。
-	// 这样不在 cn-domain 列表里的国内域名也能返回真实 IP，让 Android
-	// 手机本地直连；自定义域名规则仍按原顺序优先于内置 GEOIP。
-	tgt, _ := policy.ParseTarget(net.JoinHostPort(qname, "443"))
-	resolved, resolveErr := s.lookup(req, qname)
-	dec := s.Policy().Match(tgt)
-	if resolved != nil {
-		dec = s.Policy().MatchResolved(tgt, answerAddrs(resolved))
+	// 先尝试纯域名短路判定：
+	//   1) 广告拦截 / DoH 阻断直接回 NXDOMAIN，不向国内 DNS 泄露查询、不等 RTT；
+	//   2) 明确命中代理规则的境外域名直接改写到网关 IP，免去无意义的被污染上游查询；
+	//   3) 仅在命中显式域名 direct（需返回真实 IP）或未命中任何域名规则（需靠 GEOIP,cn
+	//      区分国内外）时，才向上游发起解析。
+	pol := s.Policy()
+	tgt := policy.TargetFromHostPort(qname, 443)
+	dec, shortCircuit := pol.MatchDomainShortCircuit(tgt)
+
+	var (
+		resolved   *dns.Msg
+		resolveErr error
+	)
+	if !shortCircuit || realIPForClient(dec) {
+		resolved, resolveErr = s.lookup(req, qname)
+		if !shortCircuit {
+			if resolved != nil {
+				dec = pol.MatchResolved(tgt, answerAddrsForPolicy(qname, resolved))
+			} else {
+				dec = pol.Match(tgt)
+			}
+		}
 	}
 
 	if dec.Action == policy.ActionBlock {
@@ -204,7 +228,7 @@ func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
 	// 其余（proxy 或 FINAL 兜底）：A 记录改写为网关 IP，
 	// 由网关嗅探 SNI 后按当前国外出口（含 KFC 本机出口）转发
 	if s.OnRewrite != nil {
-		if h, _, err := net.SplitHostPort(w.RemoteAddr().String()); err == nil {
+		if h := clientHost(w.RemoteAddr()); h != "" {
 			s.OnRewrite(h, qname)
 		}
 	}
@@ -255,6 +279,17 @@ func (s *Server) isClient(addr net.Addr) bool {
 	if !s.ClientCIDR.IsValid() {
 		return true
 	}
+	if addr == nil {
+		return false
+	}
+	switch v := addr.(type) {
+	case *net.TCPAddr:
+		ip, ok := netip.AddrFromSlice(v.IP)
+		return ok && s.ClientCIDR.Contains(ip.Unmap())
+	case *net.UDPAddr:
+		ip, ok := netip.AddrFromSlice(v.IP)
+		return ok && s.ClientCIDR.Contains(ip.Unmap())
+	}
 	host, _, err := net.SplitHostPort(addr.String())
 	if err != nil {
 		return false
@@ -266,6 +301,26 @@ func (s *Server) isClient(addr net.Addr) bool {
 	return s.ClientCIDR.Contains(ip.Unmap())
 }
 
+func clientHost(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	switch v := addr.(type) {
+	case *net.TCPAddr:
+		if ip, ok := netip.AddrFromSlice(v.IP); ok {
+			return ip.Unmap().String()
+		}
+	case *net.UDPAddr:
+		if ip, ok := netip.AddrFromSlice(v.IP); ok {
+			return ip.Unmap().String()
+		}
+	}
+	if h, _, err := net.SplitHostPort(addr.String()); err == nil {
+		return h
+	}
+	return ""
+}
+
 func (s *Server) forwardAndWrite(w dns.ResponseWriter, req *dns.Msg, _ bool, qname string) {
 	resp, err := s.lookup(req, qname)
 	if err != nil || resp == nil {
@@ -275,12 +330,19 @@ func (s *Server) forwardAndWrite(w dns.ResponseWriter, req *dns.Msg, _ bool, qna
 	_ = w.WriteMsg(resp)
 }
 
-// lookup 使用本地 TTL 缓存查询上游，并把响应 ID 调整为当前请求。
-func (s *Server) lookup(req *dns.Msg, qname string) (*dns.Msg, error) {
-	key := fmt.Sprintf("%s|%d", qname, req.Question[0].Qtype)
+const (
+	maxDNSCacheEntries = 4096
+	pruneDNSCacheTo    = 3072
+)
 
+// lookup 使用本地有界 TTL 缓存与并发合并（singleflight）查询上游，并把响应 ID 调整为当前请求。
+func (s *Server) lookup(req *dns.Msg, qname string) (*dns.Msg, error) {
+	qtype := req.Question[0].Qtype
+	key := qname + "|" + strconv.Itoa(int(qtype))
+
+	now := time.Now()
 	s.cacheMu.RLock()
-	if e, ok := s.cache[key]; ok && time.Now().Before(e.expire) {
+	if e, ok := s.cache[key]; ok && now.Before(e.expire) {
 		m := e.msg.Copy()
 		s.cacheMu.RUnlock()
 		m.Id = req.Id
@@ -289,6 +351,45 @@ func (s *Server) lookup(req *dns.Msg, qname string) (*dns.Msg, error) {
 	}
 	s.cacheMu.RUnlock()
 
+	// s.flights 未初始化（如单元测试直接字面量构造 Server）时直接查询。
+	if s.flights == nil {
+		return s.lookupUncached(req, key)
+	}
+
+	s.flightMu.Lock()
+	if call, ok := s.flights[key]; ok {
+		s.flightMu.Unlock()
+		<-call.done
+		if call.err != nil || call.resp == nil {
+			return nil, call.err
+		}
+		m := call.resp.Copy()
+		m.Id = req.Id
+		m.Question = append([]dns.Question(nil), req.Question...)
+		return m, nil
+	}
+	call := &inflightDNS{done: make(chan struct{})}
+	s.flights[key] = call
+	s.flightMu.Unlock()
+
+	resp, err := s.lookupUncached(req, key)
+	call.resp, call.err = resp, err
+	close(call.done)
+
+	s.flightMu.Lock()
+	delete(s.flights, key)
+	s.flightMu.Unlock()
+
+	if err != nil || resp == nil {
+		return nil, err
+	}
+	m := resp.Copy()
+	m.Id = req.Id
+	m.Question = append([]dns.Question(nil), req.Question...)
+	return m, nil
+}
+
+func (s *Server) lookupUncached(req *dns.Msg, key string) (*dns.Msg, error) {
 	resp, err := s.query(req)
 	if err != nil || resp == nil {
 		return nil, err
@@ -300,8 +401,24 @@ func (s *Server) lookup(req *dns.Msg, qname string) (*dns.Msg, error) {
 			ttl = t
 		}
 	}
+	now := time.Now()
 	s.cacheMu.Lock()
-	s.cache[key] = cacheEntry{msg: resp.Copy(), expire: time.Now().Add(time.Duration(ttl) * time.Second)}
+	if s.cache != nil {
+		if len(s.cache) >= maxDNSCacheEntries {
+			for k, v := range s.cache {
+				if now.After(v.expire) {
+					delete(s.cache, k)
+				}
+			}
+			for k := range s.cache {
+				if len(s.cache) < pruneDNSCacheTo {
+					break
+				}
+				delete(s.cache, k)
+			}
+		}
+		s.cache[key] = cacheEntry{msg: resp.Copy(), expire: now.Add(time.Duration(ttl) * time.Second)}
+	}
 	s.cacheMu.Unlock()
 	return resp, nil
 }
@@ -316,6 +433,23 @@ func answerAddrs(resp *dns.Msg) []netip.Addr {
 		if ip, ok := netip.AddrFromSlice(a.A); ok {
 			out = append(out, ip.Unmap())
 		}
+	}
+	return out
+}
+
+// answerAddrsForPolicy 提取供分流规则匹配的 A 记录，剔除公网域名被 GFW 污染
+// 返回的 0.0.0.0 / 127.0.0.0/8 毒丸地址，防止误中 BuiltinPre 私网直连后把假 IP 回给手机。
+func answerAddrsForPolicy(qname string, resp *dns.Msg) []netip.Addr {
+	addrs := answerAddrs(resp)
+	if len(addrs) == 0 || qname == "localhost" || strings.HasSuffix(qname, ".localhost") {
+		return addrs
+	}
+	out := addrs[:0]
+	for _, ip := range addrs {
+		if ip.IsUnspecified() || ip.IsLoopback() {
+			continue
+		}
+		out = append(out, ip)
 	}
 	return out
 }

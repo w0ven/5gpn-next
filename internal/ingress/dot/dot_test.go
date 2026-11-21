@@ -97,3 +97,78 @@ func TestRealIPOnlyForExplicitDirectRules(t *testing.T) {
 		})
 	}
 }
+
+func TestShortCircuitSkipsUpstreamForBlockAndProxy(t *testing.T) {
+	eng := policy.New()
+	_ = eng.AddRule(policy.Rule{Kind: policy.KindIPCIDR, Value: "127.0.0.0/8", Action: policy.ActionDirect})
+	_ = eng.AddRule(policy.Rule{Kind: policy.KindDomainSuffix, Value: "ads.example", Action: policy.ActionBlock})
+	_ = eng.AddRule(policy.Rule{Kind: policy.KindDomainSuffix, Value: "openai.com", Action: policy.ActionProxy, Egress: "jp"})
+	eng.SetFinal(policy.ActionProxy, "jp")
+
+	upstreamCalled := 0
+	s := &Server{
+		GatewayIP:  netip.MustParseAddr("172.22.0.1"),
+		ClientCIDR: netip.MustParsePrefix("172.22.0.0/16"),
+		Upstream:   []string{"127.0.0.1:1"}, // 若触发上游查询会报错或记入 OnUpstream
+		client:     &dns.Client{Net: "udp", Timeout: 50 * time.Millisecond},
+		Policy:     func() *policy.Engine { return eng },
+		OnUpstream: func(bool, int64) { upstreamCalled++ },
+	}
+
+	for _, tc := range []struct {
+		qname string
+		rcode int
+		wantA string
+	}{
+		{"sub.ads.example.", dns.RcodeNameError, ""},
+		{"chat.openai.com.", dns.RcodeSuccess, "172.22.0.1"},
+	} {
+		w := &captureDNSWriter{remote: &net.TCPAddr{IP: net.ParseIP("172.22.2.9"), Port: 53000}}
+		req := new(dns.Msg)
+		req.SetQuestion(tc.qname, dns.TypeA)
+		s.handle(w, req)
+		if upstreamCalled != 0 {
+			t.Fatalf("%s triggered %d upstream lookups; want 0", tc.qname, upstreamCalled)
+		}
+		if w.msg == nil || w.msg.Rcode != tc.rcode {
+			t.Fatalf("%s rcode=%v, want %d", tc.qname, w.msg, tc.rcode)
+		}
+		if tc.wantA != "" {
+			got := answerAddrs(w.msg)
+			if len(got) != 1 || got[0].String() != tc.wantA {
+				t.Fatalf("%s A=%v, want [%s]", tc.qname, got, tc.wantA)
+			}
+		}
+	}
+}
+
+func TestLoopbackPoisonDoesNotMisrouteUnknownDomainToDirect(t *testing.T) {
+	eng := policy.New()
+	_ = eng.AddRule(policy.Rule{Kind: policy.KindIPCIDR, Value: "127.0.0.0/8", Action: policy.ActionDirect})
+	eng.SetFinal(policy.ActionProxy, "jp")
+
+	poisoned := new(dns.Msg)
+	poisoned.SetQuestion("blocked-overseas.io.", dns.TypeA)
+	poisoned.Answer = []dns.RR{&dns.A{
+		Hdr: dns.RR_Header{Name: "blocked-overseas.io.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+		A:   net.ParseIP("127.0.0.1").To4(),
+	}}
+
+	s := &Server{
+		GatewayIP:  netip.MustParseAddr("172.22.0.1"),
+		ClientCIDR: netip.MustParsePrefix("172.22.0.0/16"),
+		Policy:     func() *policy.Engine { return eng },
+		cache: map[string]cacheEntry{
+			"blocked-overseas.io|1": {msg: poisoned, expire: time.Now().Add(time.Minute)},
+		},
+	}
+	w := &captureDNSWriter{remote: &net.TCPAddr{IP: net.ParseIP("172.22.2.9"), Port: 53000}}
+	req := new(dns.Msg)
+	req.SetQuestion("blocked-overseas.io.", dns.TypeA)
+	s.handle(w, req)
+
+	got := answerAddrs(w.msg)
+	if len(got) != 1 || got[0] != netip.MustParseAddr("172.22.0.1") {
+		t.Fatalf("poisoned 127.0.0.1 should be rewritten to gateway IP, got %v", got)
+	}
+}

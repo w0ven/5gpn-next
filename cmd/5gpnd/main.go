@@ -135,6 +135,7 @@ func setup(cfgPath string, loadRules bool) (*app, error) {
 
 	eng := policy.New()
 	eng.SetEgressHasV6(reg.Direct().HasIPv6())
+	eng.SetDNSUpstream(cfg.DNS.Upstream)
 
 	if loadRules {
 		if err := loadRuleSets(cfg, eng); err != nil {
@@ -869,7 +870,7 @@ func cmdRun(args []string) error {
 			// 日常 restart / 崩溃拉起不再刷屏。
 			go func() {
 				time.Sleep(2 * time.Second)
-				tb.NotifyAction(botCtx, "✅ <b>5gpn-NEXT 已就绪</b>　<code>"+version+"</code>",
+				tb.NotifyStartup(botCtx, "✅ <b>5gpn-NEXT 已就绪</b>　<code>"+version+"</code>",
 					"打开主页", "menu", "home")
 			}()
 		}

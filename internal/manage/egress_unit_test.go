@@ -38,7 +38,7 @@ func TestStripMihomoControllerRewritesConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "jp", "config.yaml")
-	orig := "socks-port: 7891\nexternal-controller: 127.0.0.1:9095\nproxies:\n"
+	orig := "socks-port: 7891\nexternal-controller: 127.0.0.1:9095\nproxies:\n\nrules:\n  - MATCH,PROXY\n"
 	if err := os.WriteFile(path, []byte(orig), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,8 @@ func TestStripMihomoControllerRewritesConfig(t *testing.T) {
 	}}}
 	m.StripMihomoController()
 	b, _ := os.ReadFile(path)
-	if strings.Contains(string(b), "external-controller") || !strings.Contains(string(b), "socks-port: 7891") {
+	if strings.Contains(string(b), "external-controller") || !strings.Contains(string(b), "socks-port: 7891") ||
+		!strings.Contains(string(b), "169.254.0.0/16,REJECT,no-resolve") {
 		t.Fatalf("改写结果不对:\n%s", b)
 	}
 	if len(calls) != 1 || calls[0] != "try-restart mihomo-5gpn@jp.service" {

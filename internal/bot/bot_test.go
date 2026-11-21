@@ -425,3 +425,35 @@ func TestRuleAddShowsEffectAndFlagsBrokenRules(t *testing.T) {
 		t.Fatalf("无效的旧规则应被标出: %s", text)
 	}
 }
+
+func TestAPIRedactsTokenInNetworkErrors(t *testing.T) {
+	b, _, _ := newTestBot(t)
+	b.Token = "123456:SECRET-BOT-TOKEN-XYZ"
+	b.apiBase = "http://127.0.0.1:1"
+
+	_, err := b.api(context.Background(), "getMe", nil)
+	if err == nil {
+		t.Fatal("expected network error")
+	}
+	if strings.Contains(err.Error(), b.Token) {
+		t.Fatalf("error leaked bot token: %v", err)
+	}
+	if !strings.Contains(err.Error(), "<REDACTED>") {
+		t.Fatalf("expected <REDACTED> in error: %v", err)
+	}
+}
+
+func TestNotifyNonStartupDoesNotSetPendingGreet(t *testing.T) {
+	b, _, _ := newTestBot(t)
+	b.apiBase = "http://127.0.0.1:1" // 强制投递失败
+
+	b.Notify(context.Background(), "出口波动告警")
+	if b.pendingGreet {
+		t.Fatal("常规通知失败不应挂起启动问候 pendingGreet")
+	}
+
+	b.NotifyStartup(context.Background(), "5gpn-NEXT 已就绪", "打开主页", "menu", "home")
+	if !b.pendingGreet {
+		t.Fatal("首次启动通知失败应置 pendingGreet=true 以便交互时补发")
+	}
+}

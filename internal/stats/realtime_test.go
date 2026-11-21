@@ -84,3 +84,15 @@ func TestSummaryUsesNaturalCalendarWindows(t *testing.T) {
 		t.Fatalf("calendar windows incorrect: days7=%d days30=%d all=%d", got.Days7.Up, got.Days30.Up, got.AllTime.Up)
 	}
 }
+
+func BenchmarkTrafficHotPath(b *testing.B) {
+	s := New(filepath.Join(b.TempDir(), "traffic.json"))
+	fixed := time.Date(2026, 11, 21, 5, 0, 0, 0, trafficLocation)
+	s.now = func() time.Time { return fixed }
+	s.Traffic("video.googlevideo.com", 1024, 2048) // 预热当日与域名槽
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.Traffic("video.googlevideo.com", 1200, 32768)
+	}
+}

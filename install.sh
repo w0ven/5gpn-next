@@ -34,12 +34,14 @@ step() { printf '\n%s==>%s %s\n' "$C_OK" "$C_OFF" "$*"; }
 dim()  { printf '%s  %s%s\n' "$C_DIM" "$*" "$C_OFF"; }
 
 remove_acme_nft_rules() {
-  local handle
-  while read -r handle; do
-    [ -n "$handle" ] || continue
-    nft delete rule inet fgpn input handle "$handle" 2>/dev/null || true
-  done < <(nft -a list chain inet fgpn input 2>/dev/null \
-    | awk '/comment "5gpn-acme-tmp"/ { for (i=1; i<=NF; i++) if ($i=="handle") print $(i+1) }')
+  local tbl handle
+  for tbl in fgpn pdg; do
+    while read -r handle; do
+      [ -n "$handle" ] || continue
+      nft delete rule inet "$tbl" input handle "$handle" 2>/dev/null || true
+    done < <(nft -a list chain inet "$tbl" input 2>/dev/null \
+      | awk '/comment "5gpn-acme-tmp"/ { for (i=1; i<=NF; i++) if ($i=="handle") print $(i+1) }')
+  done
 }
 
 [ "$(id -u)" = "0" ] || die "需要 root 权限，请用 sudo 运行"
@@ -444,10 +446,12 @@ else
       || die "certbot 安装失败，请手动安装后重试"
   }
   # HTTP-01 需要公网访问 80；insert 保证临时规则位于兜底 drop 之前。
-  if nft list chain inet fgpn input >/dev/null 2>&1; then
-    nft insert rule inet fgpn input tcp dport 80 accept comment '"5gpn-acme-tmp"' \
-      || die "临时放行 ACME 端口失败"
-  fi
+  for tbl in fgpn pdg; do
+    if nft list chain inet "$tbl" input >/dev/null 2>&1; then
+      nft insert rule inet "$tbl" input tcp dport 80 accept comment '"5gpn-acme-tmp"' \
+        || die "临时放行 ACME 端口失败"
+    fi
+  done
 
   cert_rc=0
   # shellcheck disable=SC2086
@@ -620,14 +624,18 @@ fi
 # ---------------------------------------------------------------- 6. 防火墙
 step "配置防火墙"
 
+# 客户端地址族跟随 CLIENT_CIDR（默认 IPv4，支持 IPv6 客户端网段）
+NFT_SADDR_FAM="ip"
+case "$CLIENT_CIDR" in *:*) NFT_SADDR_FAM="ip6" ;; esac
+
 DNS_NFT=""
 if [ "$DNS_ON" = "true" ]; then
   # QUIC（UDP 443）由网关接管：解析 Initial 包的 SNI 后按策略转发。
   # 旧版在此 reject 指望客户端回落 TCP，但 Google Play 下载器不回落，
   # 只会无限重试，表现为「下载永远等待中」，因此必须放行。
   DNS_NFT=$(cat <<NFTEOF
-    ip saddr ${CLIENT_CIDR} tcp dport { 80, 443, 853 } accept comment "5gpn-dns"
-    ip saddr ${CLIENT_CIDR} udp dport 443 accept comment "5gpn-quic-takeover"
+    ${NFT_SADDR_FAM} saddr ${CLIENT_CIDR} tcp dport { 80, 443, 853 } accept comment "5gpn-dns"
+    ${NFT_SADDR_FAM} saddr ${CLIENT_CIDR} udp dport 443 accept comment "5gpn-quic-takeover"
     tcp dport { 80, 443, 853 } drop comment "5gpn-deny-public-tcp"
     udp dport 443 drop comment "5gpn-deny-public-udp"
 NFTEOF
@@ -638,12 +646,14 @@ fi
 
 # 使用独立表，不触碰其它表（Docker / fail2ban / 既有规则均不受影响）
 # 表名必须以字母开头：nftables 标识符不允许数字开头，"5gpn" 会解析失败
+# 回环流量必须先放行：否则无源地址的兜底 drop 会把本机访问 127.0.0.1 丢弃。
 nft list table inet fgpn >/dev/null 2>&1 && nft delete table inet fgpn 2>/dev/null || true
 nft -f - <<EOF
 table inet fgpn {
   chain input {
     type filter hook input priority -10; policy accept;
-    ip saddr ${CLIENT_CIDR} tcp dport ${LISTEN_PORT} accept comment "5gpn-next"
+    iif "lo" accept comment "5gpn-loopback"
+    ${NFT_SADDR_FAM} saddr ${CLIENT_CIDR} tcp dport ${LISTEN_PORT} accept comment "5gpn-next"
 ${DNS_NFT}    tcp dport ${LISTEN_PORT} drop comment "5gpn-deny-public-panel"
   }
 }
@@ -662,7 +672,8 @@ nft -f - <<'RULES'
 table inet fgpn {
   chain input {
     type filter hook input priority -10; policy accept;
-    ip saddr ${CLIENT_CIDR} tcp dport ${LISTEN_PORT} accept comment "5gpn-next"
+    iif "lo" accept comment "5gpn-loopback"
+    ${NFT_SADDR_FAM} saddr ${CLIENT_CIDR} tcp dport ${LISTEN_PORT} accept comment "5gpn-next"
 ${DNS_NFT}    tcp dport ${LISTEN_PORT} drop comment "5gpn-deny-public-panel"
   }
 }
@@ -759,12 +770,14 @@ set -u
 STATE=/run/5gpn-next-cert-renew.state
 date +%s > /var/lib/5gpn-next/cert-renew-attempt 2>/dev/null || true
 rm_rules() {
-  local handle
-  while read -r handle; do
-    [ -n "$handle" ] || continue
-    nft delete rule inet fgpn input handle "$handle" 2>/dev/null || true
-  done < <(nft -a list chain inet fgpn input 2>/dev/null \
-    | awk '/comment "5gpn-acme-tmp"/ { for (i=1; i<=NF; i++) if ($i=="handle") print $(i+1) }')
+  local tbl handle
+  for tbl in fgpn pdg; do
+    while read -r handle; do
+      [ -n "$handle" ] || continue
+      nft delete rule inet "$tbl" input handle "$handle" 2>/dev/null || true
+    done < <(nft -a list chain inet "$tbl" input 2>/dev/null \
+      | awk '/comment "5gpn-acme-tmp"/ { for (i=1; i<=NF; i++) if ($i=="handle") print $(i+1) }')
+  done
 }
 rm_rules
 if grep -qsE '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*standalone' /etc/letsencrypt/renewal/*.conf \
@@ -774,13 +787,16 @@ if grep -qsE '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*standalone' /et
 else
   rm -f "$STATE"
 fi
-if nft list chain inet fgpn input >/dev/null 2>&1; then
-  if ! nft insert rule inet fgpn input tcp dport 80 accept comment '"5gpn-acme-tmp"'; then
-    [ -f "$STATE" ] && systemctl start 5gpn-next.service || true
-    rm -f "$STATE"
-    exit 1
+for tbl in fgpn pdg; do
+  if nft list chain inet "$tbl" input >/dev/null 2>&1; then
+    if ! nft insert rule inet "$tbl" input tcp dport 80 accept comment '"5gpn-acme-tmp"'; then
+      rm_rules
+      [ -f "$STATE" ] && systemctl start 5gpn-next.service || true
+      rm -f "$STATE"
+      exit 1
+    fi
   fi
-fi
+done
 exit 0
 EOF
 
@@ -790,11 +806,13 @@ cat > /etc/letsencrypt/renewal-hooks/post/5gpn-next.sh <<'EOF'
 set -u
 STATE=/run/5gpn-next-cert-renew.state
 date +%s > /var/lib/5gpn-next/cert-renew-finished 2>/dev/null || true
-while read -r handle; do
-  [ -n "$handle" ] || continue
-  nft delete rule inet fgpn input handle "$handle" 2>/dev/null || true
-done < <(nft -a list chain inet fgpn input 2>/dev/null \
-  | awk '/comment "5gpn-acme-tmp"/ { for (i=1; i<=NF; i++) if ($i=="handle") print $(i+1) }')
+for tbl in fgpn pdg; do
+  while read -r handle; do
+    [ -n "$handle" ] || continue
+    nft delete rule inet "$tbl" input handle "$handle" 2>/dev/null || true
+  done < <(nft -a list chain inet "$tbl" input 2>/dev/null \
+    | awk '/comment "5gpn-acme-tmp"/ { for (i=1; i<=NF; i++) if ($i=="handle") print $(i+1) }')
+done
 if [ -f "$STATE" ]; then
   rm -f "$STATE"
   systemctl start 5gpn-next.service || true
@@ -857,7 +875,7 @@ $(printf '%s' "$C_OK")━━━━━━━━━━━━━━━━━━━�
 
   内网 Web 面板
     https://${DOMAIN}:${LISTEN_PORT}/
-    手机连内网卡直接打开，无需登录；仅内网卡来源可访问，公网无法连接。
+    手机连内网卡直接打开可查看状态；修改设置需先在 Bot「面板登录」或运行 5gpnd panel-login 获取一次性链接。
 
   Telegram Bot
     ${BOT_HINT}

@@ -145,6 +145,17 @@ func (p *Panel) sourceAllowed(r *http.Request) bool {
 	return false
 }
 
+// setSecurityHeaders 为面板页面与静态资产设置防御性响应头。
+func setSecurityHeaders(w http.ResponseWriter, isHTML bool) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	if isHTML {
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+	}
+}
+
 // guard 包装页面处理器：校验来源网段。
 func (p *Panel) guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -152,6 +163,7 @@ func (p *Panel) guard(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		setSecurityHeaders(w, true)
 		next(w, r)
 	}
 }
@@ -276,6 +288,7 @@ func (p *Panel) serveAsset(name, ctype string) http.HandlerFunc {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		setSecurityHeaders(w, false)
 		b, err := assets.ReadFile(name)
 		if err != nil {
 			http.NotFound(w, r)
@@ -293,6 +306,7 @@ func (p *Panel) serveAppLogo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	setSecurityHeaders(w, false)
 	key := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/apps/"), ".webp")
 	if _, ok := apps.Get(key); !ok {
 		http.NotFound(w, r)
@@ -665,6 +679,7 @@ func (p *Panel) endProbe() {
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)

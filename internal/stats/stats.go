@@ -65,6 +65,8 @@ type Store struct {
 	now     func() time.Time
 
 	dirty            bool
+	todaySeq         int64
+	todayPtr         *Day
 	maxDays          int
 	maxDomain        int
 	maxBlockedDomain int
@@ -76,6 +78,7 @@ func New(path string) *Store {
 	s := &Store{
 		path:             path,
 		now:              time.Now,
+		todaySeq:         -1,
 		maxDays:          90,
 		maxDomain:        400,
 		maxBlockedDomain: 400,
@@ -113,6 +116,8 @@ func (s *Store) load() {
 		p.Since = dayKey(s.now())
 	}
 	s.data = p
+	s.todaySeq = -1
+	s.todayPtr = nil
 }
 
 // Flush 原子写盘。磁盘错误时必须恢复 dirty：旧实现先清 dirty 再写文件，
@@ -192,6 +197,10 @@ func (s *Store) prune() {
 		}
 		sort.Strings(keys)
 		for _, k := range keys[:len(keys)-s.maxDays] {
+			if s.todayPtr != nil && s.todayPtr.Date == k {
+				s.todayPtr = nil
+				s.todaySeq = -1
+			}
 			delete(s.data.Days, k)
 		}
 	}
@@ -234,13 +243,28 @@ func (s *Store) prune() {
 	}
 }
 
+func shanghaiDaySeq(t time.Time) int64 {
+	sec := t.Unix() + 8*60*60
+	if sec >= 0 {
+		return sec / 86400
+	}
+	return (sec - 86399) / 86400
+}
+
 func (s *Store) today() *Day {
-	key := dayKey(s.now())
+	now := s.now()
+	seq := shanghaiDaySeq(now)
+	if s.todayPtr != nil && s.todaySeq == seq {
+		return s.todayPtr
+	}
+	key := dayKey(now)
 	d, ok := s.data.Days[key]
 	if !ok {
 		d = &Day{Date: key}
 		s.data.Days[key] = d
 	}
+	s.todaySeq = seq
+	s.todayPtr = d
 	return d
 }
 
@@ -280,15 +304,17 @@ func (s *Store) Traffic(host string, up, down int64) {
 		return
 	}
 
+	keyHost := domainKey(host)
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	d := s.today()
 	d.Up += up
 	d.Down += down
-	if host = domainKey(host); host != "" {
-		s.data.Domains[host] += up + down
+	if keyHost != "" {
+		s.data.Domains[keyHost] += up + down
 	}
 	s.dirty = true
+	s.mu.Unlock()
 }
 
 // trafficLocation 固定使用用户侧统计口径（北京时间）。部署节点通常是
@@ -300,6 +326,11 @@ func dayKey(t time.Time) string {
 }
 
 func domainKey(host string) string {
+	// 热路径：sniff / quicfwd 传入的 SNI 已是干净小写域名（含至少一个字母且无空白/尾点），
+	// 一趟扫描即可在零内存分配且免调 netip.ParseAddr 的情况下直接返回。
+	if isCleanLowerDomain(host) {
+		return host
+	}
 	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 	if host == "" {
 		return ""
@@ -308,6 +339,24 @@ func domainKey(host string) string {
 		return ""
 	}
 	return host
+}
+
+func isCleanLowerDomain(s string) bool {
+	if s == "" || s[len(s)-1] == '.' {
+		return false
+	}
+	hasAlpha := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			hasAlpha = true
+		case c >= '0' && c <= '9', c == '.', c == '-', c == '_':
+		default:
+			return false
+		}
+	}
+	return hasAlpha
 }
 
 // AdBlockSuccess 记录一次已成功写回客户端的广告 NXDOMAIN 响应。

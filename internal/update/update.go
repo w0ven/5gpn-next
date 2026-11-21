@@ -65,10 +65,10 @@ type Manager struct {
 
 // 升级阶段常量。
 const (
-	StageDownload = "download"  // 下载二进制
-	StageVerify   = "verify"    // SHA256 校验
-	StageBackup   = "backup"    // 备份当前版本
-	StageRestart  = "restart"   // 调度事务，即将重启
+	StageDownload = "download" // 下载二进制
+	StageVerify   = "verify"   // SHA256 校验
+	StageBackup   = "backup"   // 备份当前版本
+	StageRestart  = "restart"  // 调度事务，即将重启
 )
 
 func (m *Manager) stage(stage, detail string) {
